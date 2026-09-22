@@ -66,7 +66,7 @@ def register_middleware(app: FastAPI):
         "http://127.0.0.1:8080",  # Alternative frontend port
         "https://localhost:3000",  # HTTPS variants
         "https://127.0.0.1:3000",
-        "https://campusio.online"
+        "https://www.campusio.online"
     ]
     
     # ✅ OPTIMIZATION: Add GZIP compression middleware
