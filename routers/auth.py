@@ -58,7 +58,7 @@ class UpdateUserStatusRequest(SQLModel):
 
 
 # Roles that require mandatory OTP
-MANDATORY_OTP_ROLES = {UserRole.SCHOOL_ADMIN, UserRole.HR, UserRole.SUPER_ADMIN}
+MANDATORY_OTP_ROLES = {}
 
 
 def _generate_password(length: int = 12) -> str:
