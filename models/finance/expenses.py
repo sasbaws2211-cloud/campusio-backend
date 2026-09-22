@@ -7,8 +7,11 @@ from sqlmodel import SQLModel, Field
 from sqlalchemy import Enum as SQLEnum, Column
 from typing import Optional, List
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 import uuid
+
+from .chart_of_accounts import MONEY_MAX_DIGITS, MONEY_DECIMAL_PLACES, Money
 
 
 class ExpenseCategory(str, Enum):
@@ -46,21 +49,77 @@ class PaymentStatus(str, Enum):
     PAID = "paid"                   # Fully paid
 
 
+class Vendor(SQLModel, table=True):
+    """A minimal supplier/vendor master record — previously `Expense.vendor_name`
+    was the only place a vendor existed anywhere in this codebase (a free
+    string, re-typed differently every time), with no way to see "everything
+    we've ever bought from this supplier" or track payment terms. Expense
+    keeps `vendor_name` for backward compatibility and for a one-off payee
+    that doesn't warrant a master record; `vendor_id` is the real link when
+    one exists."""
+    __tablename__ = "vendors"
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    school_id: str = Field(index=True)
+    name: str
+    contact_name: Optional[str] = None
+    contact_phone: Optional[str] = None
+    contact_email: Optional[str] = None
+    address: Optional[str] = None
+    # How many days after an invoice this vendor expects payment — purely
+    # informational today (not yet enforced anywhere), but gives a school
+    # somewhere real to record it instead of a side note.
+    payment_terms_days: Optional[int] = None
+    is_active: bool = Field(default=True, index=True)
+    created_by: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class VendorCreate(SQLModel):
+    name: str
+    contact_name: Optional[str] = None
+    contact_phone: Optional[str] = None
+    contact_email: Optional[str] = None
+    address: Optional[str] = None
+    payment_terms_days: Optional[int] = None
+
+
+class VendorUpdate(SQLModel):
+    name: Optional[str] = None
+    contact_name: Optional[str] = None
+    contact_phone: Optional[str] = None
+    contact_email: Optional[str] = None
+    address: Optional[str] = None
+    payment_terms_days: Optional[int] = None
+    is_active: Optional[bool] = None
+
+
 class Expense(SQLModel, table=True):
     """Individual expense record"""
     __tablename__ = "expenses"
-    
+
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
     school_id: str = Field(index=True)
-    
+
     # Description and classification
     category: ExpenseCategory = Field(index=True)
     description: str  # What was the expense for
-    vendor_name: Optional[str] = None  # Who was paid
+    vendor_name: Optional[str] = None  # Who was paid — free text, kept for backward compatibility and one-off payees
+    vendor_id: Optional[str] = Field(default=None, index=True)  # Vendor.id, when this payee has a real master record
     
-    # Amounts
-    amount: float = Field(gt=0.0)  # Must be positive
+    # Amounts — Decimal/Numeric, matching the GL fields this posts against.
+    amount: Decimal = Field(
+        gt=Decimal("0"), max_digits=MONEY_MAX_DIGITS, decimal_places=MONEY_DECIMAL_PLACES
+    )  # Must be positive, in `currency`
     currency: str = Field(default="GHS")
+    # Populated at posting time if currency != the school's base_currency —
+    # the GL entry is always posted in base_currency, converted using the
+    # exchange rate applicable on expense_date (see ExchangeRateService).
+    base_currency_amount: Optional[Decimal] = Field(
+        default=None, max_digits=MONEY_MAX_DIGITS, decimal_places=MONEY_DECIMAL_PLACES
+    )
+    exchange_rate_applied: Optional[Decimal] = Field(default=None, max_digits=18, decimal_places=6)
     
     # GL mapping
     gl_account_id: Optional[str] = None  # Maps to GL account
@@ -94,13 +153,18 @@ class Expense(SQLModel, table=True):
             index=True
         )
     )
-    amount_paid: float = Field(default=0.0, ge=0.0)
+    amount_paid: Decimal = Field(
+        default=Decimal("0"), ge=Decimal("0"), max_digits=MONEY_MAX_DIGITS, decimal_places=MONEY_DECIMAL_PLACES
+    )
     payment_date: Optional[datetime] = None
     paid_by: Optional[str] = None
     
     # Journal entry link (if posted to GL)
     journal_entry_id: Optional[str] = None  # JE ID when posted
     gl_posting_reference: Optional[str] = None  # Reference like "JE-12345" ⭐ NEW
+
+    # Supporting documentation (invoice/receipt image or PDF)
+    receipt_url: Optional[str] = None
     
     # Audit
     notes: Optional[str] = None
@@ -114,7 +178,8 @@ class ExpenseCreate(SQLModel):
     category: ExpenseCategory
     description: str
     vendor_name: Optional[str] = None
-    amount: float
+    vendor_id: Optional[str] = None
+    amount: Decimal
     currency: str = "GHS"
     gl_account_id: Optional[str] = None
     gl_account_code: Optional[str] = None
@@ -127,7 +192,7 @@ class ExpenseUpdate(SQLModel):
     category: Optional[ExpenseCategory] = None
     description: Optional[str] = None
     vendor_name: Optional[str] = None
-    amount: Optional[float] = None
+    amount: Optional[Decimal] = None
     gl_account_id: Optional[str] = None
     gl_account_code: Optional[str] = None
     expense_date: Optional[datetime] = None
@@ -151,7 +216,7 @@ class ExpenseRejectionRequest(SQLModel):
 
 class ExpensePaymentRequest(SQLModel):
     """Request model for recording expense payment"""
-    amount_paid: float
+    amount_paid: Decimal
     payment_date: datetime
     payment_notes: Optional[str] = None
 
@@ -163,20 +228,27 @@ class ExpenseResponse(SQLModel):
     category: ExpenseCategory
     description: str
     vendor_name: Optional[str]
-    amount: float
+    amount: Money
     currency: str
+    base_currency_amount: Optional[Money] = None
+    # Money's PlainSerializer only controls JSON output shape (Decimal ->
+    # float), not rounding, so it's fine to reuse for a 6dp rate too — the
+    # point is just avoiding the "12.500000" string Pydantic's default
+    # Decimal JSON encoding would otherwise produce.
+    exchange_rate_applied: Optional[Money] = None
     gl_account_id: Optional[str]
     gl_account_code: Optional[str]
     expense_date: datetime
     status: ExpenseStatus
     payment_status: PaymentStatus
-    amount_paid: float
+    amount_paid: Money
     submitted_by: Optional[str]
     submitted_at: Optional[datetime]
     approved_by: Optional[str]
     approved_date: Optional[datetime]
     rejected_reason: Optional[str]
     journal_entry_id: Optional[str]
+    receipt_url: Optional[str] = None
     notes: Optional[str]
     created_by: str
     created_at: datetime
@@ -193,9 +265,9 @@ class ExpenseSummary(SQLModel):
     approved_count: int
     posted_count: int
     rejected_count: int
-    total_amount: float
-    total_paid: float
-    outstanding_amount: float
+    total_amount: Money
+    total_paid: Money
+    outstanding_amount: Money
     by_category: dict  # {category: {count, total_amount, total_paid}}
 
 
@@ -203,7 +275,7 @@ class ExpenseByCategory(SQLModel):
     """Breakdown of expenses by category"""
     category: ExpenseCategory
     count: int
-    total_amount: float
-    total_paid: float
-    outstanding_amount: float
+    total_amount: Money
+    total_paid: Money
+    outstanding_amount: Money
     percentage_of_total: float

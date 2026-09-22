@@ -187,7 +187,14 @@ class DateSeparationService:
                         JournalEntry.posted_date >= period.start_date,
                         JournalEntry.posted_date <= period.end_date,
                         JournalEntry.entry_date < period.start_date,
-                        JournalEntry.posting_status == PostingStatus.POSTED,
+                        # POSTED *and* REVERSED, not POSTED alone: this is an
+                        # audit/compliance report of posting-timing behavior,
+                        # so an entry that was later reversed still needs to
+                        # show up here — it WAS posted with this cutoff
+                        # mismatch, and that fact doesn't stop being true (or
+                        # stop being worth investigating) just because it was
+                        # subsequently reversed.
+                        JournalEntry.posting_status.in_([PostingStatus.POSTED, PostingStatus.REVERSED]),
                     )
                 )
             )
@@ -202,7 +209,9 @@ class DateSeparationService:
                         JournalEntry.posted_date >= period.start_date,
                         JournalEntry.posted_date <= period.end_date,
                         JournalEntry.entry_date > period.end_date,
-                        JournalEntry.posting_status == PostingStatus.POSTED,
+                        # POSTED *and* REVERSED, not POSTED alone: see
+                        # early_entries above for why.
+                        JournalEntry.posting_status.in_([PostingStatus.POSTED, PostingStatus.REVERSED]),
                     )
                 )
             )
@@ -269,11 +278,13 @@ class DateSeparationService:
                         JournalEntry.school_id == school_id,
                         JournalEntry.fiscal_period_id == period_id,
                         JournalEntry.posted_date < JournalEntry.entry_date,
-                        JournalEntry.posting_status == PostingStatus.POSTED,
+                        # POSTED *and* REVERSED, not POSTED alone: same
+                        # audit-trail reasoning as get_cutoff_entries.
+                        JournalEntry.posting_status.in_([PostingStatus.POSTED, PostingStatus.REVERSED]),
                     )
                 )
             )
-            
+
             return [
                 {
                     "id": e.id,
@@ -317,7 +328,9 @@ class DateSeparationService:
                         JournalEntry.school_id == school_id,
                         JournalEntry.fiscal_period_id == period_id,
                         JournalEntry.is_adjusting_entry == True,
-                        JournalEntry.posting_status == PostingStatus.POSTED,
+                        # POSTED *and* REVERSED, not POSTED alone: same
+                        # audit-trail reasoning as get_cutoff_entries.
+                        JournalEntry.posting_status.in_([PostingStatus.POSTED, PostingStatus.REVERSED]),
                     )
                 ).order_by(JournalEntry.posted_date.desc())
             )
@@ -451,11 +464,13 @@ class DateSeparationService:
                     and_(
                         JournalEntry.school_id == school_id,
                         JournalEntry.fiscal_period_id == period_id,
-                        JournalEntry.posting_status == PostingStatus.POSTED,
+                        # POSTED *and* REVERSED, not POSTED alone: same
+                        # audit-trail reasoning as get_cutoff_entries.
+                        JournalEntry.posting_status.in_([PostingStatus.POSTED, PostingStatus.REVERSED]),
                     )
                 )
             )
-            
+
             all_entries = entries.scalars().all()
             
             # Analyze variances

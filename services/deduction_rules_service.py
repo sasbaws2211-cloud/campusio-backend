@@ -5,13 +5,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 from decimal import Decimal
 import json
-import re
 
 from models.payroll import (
     DeductionRule, RuleOperator, RuleType, RuleEvaluationResult
 )
 from models.staff import Staff
 from models.user import User
+from services.safe_expression_eval import safe_eval_expression, UnsafeExpressionError
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 class RulesEvaluationService:
@@ -162,38 +165,22 @@ class RulesEvaluationService:
     
     def _evaluate_expression(self, expression: str, context: Dict[str, Any]) -> bool:
         """
-        Evaluate a complex expression against context
-        
+        Evaluate a complex expression against context.
+
         Example expressions:
         - "basic_salary > 5000 and years_service > 5"
         - "absent_days >= 3 or leave_type == 'unpaid'"
+
+        Evaluated via services.safe_expression_eval — an AST-walking
+        evaluator against `context` directly, not a string-substitution +
+        eval() (the prior approach here, which risked a string context
+        value with a stray quote breaking out of its literal and injecting
+        arbitrary expression syntax).
         """
         try:
-            # Replace field names with their values from context
-            eval_expr = expression
-            
-            for field, value in context.items():
-                # Handle string values with quotes
-                if isinstance(value, str):
-                    eval_expr = re.sub(
-                        rf'\b{field}\b',
-                        f"'{value}'",
-                        eval_expr
-                    )
-                else:
-                    eval_expr = re.sub(
-                        rf'\b{field}\b',
-                        str(value),
-                        eval_expr
-                    )
-            
-            # Only allow safe operations
-            allowed_names = {"True": True, "False": False}
-            result = eval(eval_expr, {"__builtins__": {}}, allowed_names)
-            return bool(result)
-            
-        except Exception as e:
-            print(f"Error evaluating expression '{expression}': {str(e)}")
+            return safe_eval_expression(expression, context)
+        except (UnsafeExpressionError, SyntaxError, ValueError, TypeError) as e:
+            logger.warning(f"Error evaluating expression '{expression}': {str(e)}")
             return False
     
     def _calculate_deduction(

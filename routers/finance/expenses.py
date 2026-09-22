@@ -19,7 +19,9 @@ EXPENSE LIFECYCLE:
 - REJECTED: Rejected during approval (no GL posting)
 """
 import logging
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+import uuid
+from pathlib import Path as FilePath
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status, Query, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional, List
 from datetime import datetime
@@ -37,17 +39,52 @@ from models.finance import (
     ExpenseRejectionRequest,
     ExpensePaymentRequest,
     ExpenseSummary,
+    Vendor,
+    VendorCreate,
+    VendorUpdate,
 )
+from sqlmodel import select
 from models.finance.gl_audit_log import AuditActionType, AuditEntityType
-from models.user import User, UserRole
+from models.user import User
 from database import get_session
-from auth import get_current_user, require_roles
+from auth import get_current_user, require_permission
 from services.expense_service import ExpenseService, ExpenseError, ExpenseValidationError
 from services.gl_audit_log_service import GLAuditLogService
+from services.plan_gating import require_plan_feature
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/expenses", tags=["Finance - Expenses"])
+router = APIRouter(
+    prefix="/expenses", tags=["Finance - Expenses"],
+    dependencies=[Depends(require_plan_feature("finance_advanced"))],
+)
+
+# Local-disk receipt storage, matching the pattern already used by
+# routers/library.py — no S3/cloud storage client exists in this codebase.
+RECEIPT_UPLOAD_DIR = FilePath("uploads/expenses")
+RECEIPT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_RECEIPT_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "application/pdf"}
+MAX_RECEIPT_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
+async def _save_receipt(file: UploadFile, school_id: str) -> str:
+    if file.content_type not in ALLOWED_RECEIPT_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported file type: {file.content_type}. Allowed: JPEG, PNG, WEBP, PDF.",
+        )
+    content = await file.read()
+    if len(content) > MAX_RECEIPT_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Receipt file exceeds the 10 MB limit.",
+        )
+    filename = f"{uuid.uuid4()}_{FilePath(file.filename or 'receipt').name}"
+    target_path = RECEIPT_UPLOAD_DIR / school_id / filename
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_bytes(content)
+    return f"/uploads/expenses/{school_id}/{filename}"
 
 
 async def _log_gl_audit(
@@ -76,16 +113,102 @@ async def _log_gl_audit(
         logger.warning(f"Failed to write GL audit log for expense {entity_id}: {e}")
 
 
+# ==================== Vendors ====================
+# A minimal supplier master record — previously `Expense.vendor_name` was
+# the only place a vendor existed anywhere, a free string re-typed
+# differently every time with no real "who do we owe, in total" view.
+
+@router.get("/vendors", response_model=list[Vendor])
+async def list_vendors(
+    active_only: bool = True,
+    current_user: User = Depends(require_permission("finance.vendor.manage")),
+    session: AsyncSession = Depends(get_session),
+):
+    school_id = current_user.school_id
+    if not school_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No school context")
+    query = select(Vendor).where(Vendor.school_id == school_id)
+    if active_only:
+        query = query.where(Vendor.is_active == True)  # noqa: E712
+    result = await session.execute(query.order_by(Vendor.name))
+    return result.scalars().all()
+
+
+@router.post("/vendors", response_model=Vendor, status_code=status.HTTP_201_CREATED)
+async def create_vendor(
+    payload: VendorCreate,
+    current_user: User = Depends(require_permission("finance.vendor.manage")),
+    session: AsyncSession = Depends(get_session),
+):
+    school_id = current_user.school_id
+    if not school_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No school context")
+    vendor = Vendor(school_id=school_id, created_by=current_user.id, **payload.model_dump())
+    session.add(vendor)
+    await session.commit()
+    await session.refresh(vendor)
+    return vendor
+
+
+@router.patch("/vendors/{vendor_id}", response_model=Vendor)
+async def update_vendor(
+    vendor_id: str,
+    payload: VendorUpdate,
+    current_user: User = Depends(require_permission("finance.vendor.manage")),
+    session: AsyncSession = Depends(get_session),
+):
+    school_id = current_user.school_id
+    result = await session.execute(select(Vendor).where(Vendor.id == vendor_id, Vendor.school_id == school_id))
+    vendor = result.scalar_one_or_none()
+    if not vendor:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vendor not found")
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        setattr(vendor, key, value)
+    vendor.updated_at = datetime.utcnow()
+    session.add(vendor)
+    await session.commit()
+    await session.refresh(vendor)
+    return vendor
+
+
+@router.get("/vendors/{vendor_id}/balance", response_model=dict)
+async def get_vendor_balance(
+    vendor_id: str,
+    current_user: User = Depends(require_permission("finance.vendor.manage")),
+    session: AsyncSession = Depends(get_session),
+):
+    """How much this school currently owes this vendor across all POSTED
+    expenses — the real accounts-payable-by-vendor view that previously
+    had nothing to aggregate at all (every expense assumed same-day cash
+    payment, so there was never an "amount owed" to report)."""
+    school_id = current_user.school_id
+    result = await session.execute(select(Vendor).where(Vendor.id == vendor_id, Vendor.school_id == school_id))
+    vendor = result.scalar_one_or_none()
+    if not vendor:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vendor not found")
+
+    expenses_result = await session.execute(
+        select(Expense).where(Expense.vendor_id == vendor_id, Expense.school_id == school_id, Expense.status == ExpenseStatus.POSTED)
+    )
+    expenses = expenses_result.scalars().all()
+    total_billed = sum(float(e.amount) for e in expenses)
+    total_paid = sum(float(e.amount_paid) for e in expenses)
+    return {
+        "vendor_id": vendor_id,
+        "vendor_name": vendor.name,
+        "total_billed": round(total_billed, 2),
+        "total_paid": round(total_paid, 2),
+        "amount_owed": round(total_billed - total_paid, 2),
+        "open_expense_count": sum(1 for e in expenses if e.payment_status != PaymentStatus.PAID),
+    }
+
+
 # ==================== Expense Creation ====================
 
 @router.post("", response_model=ExpenseResponse, status_code=status.HTTP_201_CREATED)
 async def create_expense(
     expense_data: ExpenseCreate,
-    current_user: User = Depends(require_roles(
-        UserRole.SUPER_ADMIN,
-        UserRole.SCHOOL_ADMIN,
-        UserRole.HR,
-    )),
+    current_user: User = Depends(require_permission("finance.expense.create")),
     session: AsyncSession = Depends(get_session),
 ):
     """Create a new expense record (in DRAFT status)
@@ -279,11 +402,7 @@ async def list_expenses(
 async def update_expense(
     expense_id: str,
     update_data: ExpenseUpdate,
-    current_user: User = Depends(require_roles(
-        UserRole.SUPER_ADMIN,
-        UserRole.SCHOOL_ADMIN,
-        UserRole.HR,
-    )),
+    current_user: User = Depends(require_permission("finance.expense.update")),
     session: AsyncSession = Depends(get_session),
 ):
     """Update a DRAFT expense
@@ -337,17 +456,69 @@ async def update_expense(
         )
 
 
+@router.post("/{expense_id}/receipt", response_model=ExpenseResponse)
+async def upload_expense_receipt(
+    expense_id: str,
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_permission("finance.expense.update")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Attach a receipt/invoice image or PDF to an expense
+
+    **Access:** SUPER_ADMIN, SCHOOL_ADMIN, HR
+
+    Accepts JPEG, PNG, WEBP, or PDF up to 10 MB. Stored on local disk under
+    uploads/expenses/{school_id}/ and served back via the returned receipt_url.
+    Replaces any previously attached receipt.
+    """
+    school_id = current_user.school_id
+    if not school_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No school context"
+        )
+
+    service = ExpenseService(session)
+
+    expense = await service.get_expense_by_id(school_id, expense_id)
+    if not expense:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Expense {expense_id} not found"
+        )
+
+    receipt_url = await _save_receipt(file, school_id)
+
+    try:
+        updated_expense = await service.attach_receipt(
+            school_id=school_id,
+            expense_id=expense_id,
+            receipt_url=receipt_url,
+        )
+        await _log_gl_audit(
+            session, school_id, expense_id, AuditActionType.EXPENSE_UPDATED, current_user,
+            new_values={"receipt_url": receipt_url},
+        )
+        return ExpenseResponse.model_validate(updated_expense)
+    except ExpenseError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error attaching receipt: {str(e)}"
+        )
+
+
 # ==================== Approval Workflow ====================
 
 @router.post("/{expense_id}/submit", response_model=ExpenseResponse)
 async def submit_expense(
     expense_id: str,
     request: ExpenseSubmitRequest,
-    current_user: User = Depends(require_roles(
-        UserRole.SUPER_ADMIN,
-        UserRole.SCHOOL_ADMIN,
-        UserRole.HR,
-    )),
+    current_user: User = Depends(require_permission("finance.expense.update")),
     session: AsyncSession = Depends(get_session),
 ):
     """Submit expense for approval (DRAFT → PENDING)
@@ -401,10 +572,8 @@ async def submit_expense(
 async def approve_expense(
     expense_id: str,
     request: ExpenseApprovalRequest,
-    current_user: User = Depends(require_roles(
-        UserRole.SUPER_ADMIN,
-        UserRole.SCHOOL_ADMIN,
-    )),
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(require_permission("finance.expense.approve")),
     session: AsyncSession = Depends(get_session),
 ):
     """Approve an expense for GL posting (PENDING → APPROVED)
@@ -437,6 +606,7 @@ async def approve_expense(
             expense_id=expense_id,
             approved_by=current_user.id,
             approval_notes=request.approval_notes,
+            background_tasks=background_tasks,
         )
         await _log_gl_audit(
             session, school_id, expense_id, AuditActionType.EXPENSE_APPROVED, current_user,
@@ -459,10 +629,7 @@ async def approve_expense(
 async def reject_expense(
     expense_id: str,
     request: ExpenseRejectionRequest,
-    current_user: User = Depends(require_roles(
-        UserRole.SUPER_ADMIN,
-        UserRole.SCHOOL_ADMIN,
-    )),
+    current_user: User = Depends(require_permission("finance.expense.approve")),
     session: AsyncSession = Depends(get_session),
 ):
     """Reject an expense (PENDING → REJECTED)
@@ -518,10 +685,7 @@ async def reject_expense(
 @router.post("/{expense_id}/post", response_model=ExpenseResponse)
 async def post_expense_to_gl(
     expense_id: str,
-    current_user: User = Depends(require_roles(
-        UserRole.SUPER_ADMIN,
-        UserRole.SCHOOL_ADMIN,
-    )),
+    current_user: User = Depends(require_permission("finance.expense.post")),
     session: AsyncSession = Depends(get_session),
 ):
     """Post approved expense to GL (APPROVED → POSTED)
@@ -586,10 +750,7 @@ async def post_expense_to_gl(
 async def record_expense_payment(
     expense_id: str,
     request: ExpensePaymentRequest,
-    current_user: User = Depends(require_roles(
-        UserRole.SUPER_ADMIN,
-        UserRole.SCHOOL_ADMIN,
-    )),
+    current_user: User = Depends(require_permission("finance.expense.post")),
     session: AsyncSession = Depends(get_session),
 ):
     """Record a payment for an expense

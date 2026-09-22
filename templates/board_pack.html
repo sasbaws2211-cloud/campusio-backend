@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>Board Report Pack - {{ school_name }}</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: Helvetica, Arial, sans-serif;
+            color: #111;
+            background: #fff;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+
+        .cover {
+            text-align: center;
+            padding-top: 120px;
+        }
+        .cover .school-name { font-size: 26px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.5px; }
+        .cover .pack-title { font-size: 18px; font-weight: bold; margin-top: 14px; text-transform: uppercase; letter-spacing: 2px; }
+        .cover .period-line { font-size: 13px; margin-top: 10px; color: #444; }
+        .cover .generated-line { font-size: 11px; margin-top: 40px; color: #777; }
+
+        .section { page-break-before: always; padding-top: 10px; }
+        .section-title {
+            font-size: 16px;
+            font-weight: bold;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border-bottom: 2px solid #111;
+            padding-bottom: 6px;
+            margin-bottom: 12px;
+        }
+
+        .summary-table { width: 100%; border-collapse: collapse; margin-bottom: 14px; }
+        .summary-table td { padding: 4px 8px; font-size: 12px; border: 1px solid #ccc; }
+        .summary-table td.label { font-weight: bold; background: #f3f3f3; width: 45%; }
+
+        .data-table { width: 100%; border-collapse: collapse; margin-bottom: 10px; }
+        .data-table th, .data-table td { border: 1px solid #999; padding: 4px 6px; font-size: 10.5px; }
+        .data-table th { background: #efefef; text-transform: uppercase; letter-spacing: 0.3px; font-size: 9.5px; text-align: left; }
+        .row-note { font-size: 10px; color: #666; margin-top: 4px; }
+
+        .empty-note { color: #777; font-style: italic; padding: 8px 0; }
+
+        .goal-row td { vertical-align: top; }
+        .goal-status { font-weight: bold; text-transform: uppercase; font-size: 9.5px; }
+
+        .footer-note { text-align: center; font-size: 9px; color: #999; margin-top: 24px; }
+    </style>
+</head>
+<body>
+    <div class="cover">
+        <div class="school-name">{{ school_name }}</div>
+        <div class="pack-title">Board Report Pack</div>
+        <div class="period-line">Period: {{ period_start }} to {{ period_end }}{% if academic_term_name %} &middot; {{ academic_term_name }}{% endif %}</div>
+        <div class="generated-line">Generated {{ generated_date }}</div>
+    </div>
+
+    {% for section in sections %}
+    <div class="section">
+        <div class="section-title">{{ section.title }}</div>
+
+        {% if section.summary %}
+        <table class="summary-table">
+            {% for key, value in section.summary.items() %}
+            <tr>
+                <td class="label">{{ key.replace('_', ' ') }}</td>
+                <td>{{ value }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% endif %}
+
+        {% if section.rows %}
+        <table class="data-table">
+            <thead>
+                <tr>
+                    {% for col in section.columns %}
+                    <th>{{ col.replace('_', ' ') }}</th>
+                    {% endfor %}
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in section.rows %}
+                <tr>
+                    {% for col in section.columns %}
+                    <td>{{ row.get(col, '') }}</td>
+                    {% endfor %}
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% if section.truncated %}
+        <div class="row-note">Showing the first {{ section.rows|length }} of {{ section.total_rows }} rows — see the full CSV export for the complete dataset.</div>
+        {% endif %}
+        {% else %}
+        <div class="empty-note">No data for the selected period.</div>
+        {% endif %}
+    </div>
+    {% endfor %}
+
+    <div class="section">
+        <div class="section-title">Strategic Goals Progress</div>
+        {% if goals %}
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Goal</th><th>Category</th><th>Target</th><th>Current</th><th>Status</th><th>Target Date</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for goal in goals %}
+                <tr class="goal-row">
+                    <td>{{ goal.title }}</td>
+                    <td>{{ goal.category }}</td>
+                    <td>{{ goal.target_value }}{% if goal.unit %} {{ goal.unit }}{% endif %}</td>
+                    <td>{{ goal.current_value if goal.current_value is not none else '—' }}{% if goal.unit and goal.current_value is not none %} {{ goal.unit }}{% endif %}</td>
+                    <td class="goal-status">{{ goal.status.replace('_', ' ') }}</td>
+                    <td>{{ goal.target_date }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-note">No strategic goals have been set up yet.</div>
+        {% endif %}
+    </div>
+
+    <div class="footer-note">Campusio Board Report Pack &middot; Generated {{ generated_date }}</div>
+</body>
+</html>

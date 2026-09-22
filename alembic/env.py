@@ -24,7 +24,7 @@ from models.classroom import Class ,ClassLevel,ClassSubject
 from models.communication import Announcement,Message,EmailNotification
 from models.fee import Fee,FeePayment,FeeStructure
 from models.grade import Grade,ReportCard
-from models.school import School,AcademicTerm
+from models.school import School, AcademicTerm, AcademicYear, CalendarEvent
 from models.staff import Staff,TeacherAssignment
 from models.student import Student,Parent,StudentParent
 from models.timetable import Period,Timetable  
@@ -34,6 +34,23 @@ from models.finance.chart_of_accounts import GLAccount
 from models.finance.journal_entries import JournalEntry, JournalLineItem
 from models.finance.expenses import Expense
 from models.payment import OnlineTransaction, PaymentVerification
+from models.front_office import FrontOfficeVisitor
+from models.admissions import Applicant
+from models.health import StudentHealthProfile, ClinicVisit, ImmunizationRecord
+from models.discipline import IncidentReport, IncidentStudent, IncidentAction
+from models.inventory import AssetCategory, Asset, StockItem, StockIssuance
+from models.alumni import AlumniRecord, AlumniDonation
+from models.exam_board import ExamBoardRegistration, ExamSeatingAssignment, InvigilationDuty
+from models.certificates import CertificateIssuance, CertificateTemplate, IDCard
+from models.campus import Campus
+from models.ptm import PTMSlot, PTMBooking
+from models.document import Document
+from models.leave_request import LeaveRequest, LeaveBalance
+from models.rbac import Permission, Role, RolePermission
+from models.integrations import ApiKey, WebhookEndpoint, WebhookDelivery, QuickBooksConnection
+from models.procurement import Supplier, PurchaseOrder, PurchaseOrderLine
+from models.hr import StaffPerformanceReview
+from models.student_support import StudentSupportCase
 
 # set target metadata for 'autogenerate' support
 target_metadata = SQLModel.metadata

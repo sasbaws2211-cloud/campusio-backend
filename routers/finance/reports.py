@@ -33,8 +33,12 @@ from models.user import User
 from database import get_session
 from auth import get_current_user
 from services.reports_service import ReportsService, ReportsServiceError
+from services.plan_gating import require_plan_feature
 
-router = APIRouter(prefix="/finance-reports", tags=["Finance - Reports"])
+router = APIRouter(
+    prefix="/finance-reports", tags=["Finance - Reports"],
+    dependencies=[Depends(require_plan_feature("finance_advanced"))],
+)
 
 
 # ==================== Metadata Endpoint ====================

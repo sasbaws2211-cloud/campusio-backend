@@ -1,10 +1,12 @@
 """Student Portal Router - API endpoints for students to view their own information"""
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from fastapi.encoders import jsonable_encoder
 from sqlmodel import select, SQLModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta
 from typing import List, Optional
 import json
+import logging
 import os
 import uuid
 from models.user import User, UserRole
@@ -14,16 +16,38 @@ from models.fee import Fee, FeePayment, FeeStructure, PaymentStatus
 from models.attendance import Attendance, AttendanceStatus
 from models.classroom import Class, Subject
 from models.timetable import Timetable, Period, DayOfWeek
+from models.school import AcademicTerm
 from models.communication import Announcement
 from models.staff import Staff
-from models.assignment import Assignment, Submission, SubmissionStatus, AssignmentStatus, AssignmentQuestion
+from models.assignment import (
+    Assignment, Submission, SubmissionStatus, AssignmentStatus, AssignmentQuestion,
+    CourseModule, CourseModuleItem, StudentModuleProgress,
+)
 from models.hostel import StudentHostel, HostelFee
 from models.transport import StudentTransport, TransportFee, Route
+from models.library import LibraryItem
 from database import get_session
 from auth import get_current_user, require_roles
 from services.auto_grader import AutoGrader
+from services.question_formatting import format_assignment_questions
+from services.submission_lifecycle import resolve_submission_status
+from services.assignment_grade_bridge import sync_submission_to_grade
+from services import grading_service
+from services.report_card_pdf_service import compute_subject_ges_totals, compute_overall_ges_score
+from utils import grade_scale as shared_ges_scale
 
 router = APIRouter(prefix="/student-portal", tags=["Student Portal"])
+logger = logging.getLogger(__name__)
+
+
+async def _get_current_term_id(session: AsyncSession, school_id: str) -> Optional[str]:
+    """Without this, the timetable endpoints below showed every term's entries
+    stacked together the moment a school had more than one term of data."""
+    result = await session.execute(
+        select(AcademicTerm).where(AcademicTerm.school_id == school_id, AcademicTerm.is_current == True)
+    )
+    term = result.scalar_one_or_none()
+    return term.id if term else None
 
 
 class SubmitAssignmentRequest(SQLModel):
@@ -32,25 +56,9 @@ class SubmitAssignmentRequest(SQLModel):
 
 
 
-# GES Grading Scale
-GES_GRADE_SCALE = [
-    {"grade": "1", "min_score": 80, "max_score": 100, "description": "Excellent"},
-    {"grade": "2", "min_score": 70, "max_score": 79, "description": "Very Good"},
-    {"grade": "3", "min_score": 60, "max_score": 69, "description": "Good"},
-    {"grade": "4", "min_score": 55, "max_score": 59, "description": "Credit"},
-    {"grade": "5", "min_score": 50, "max_score": 54, "description": "Pass"},
-    {"grade": "6", "min_score": 45, "max_score": 49, "description": "Weak Pass"},
-    {"grade": "7", "min_score": 40, "max_score": 44, "description": "Very Weak"},
-    {"grade": "8", "min_score": 35, "max_score": 39, "description": "Poor"},
-    {"grade": "9", "min_score": 0, "max_score": 34, "description": "Fail"},
-]
-
-
-def get_letter_grade(percentage: float) -> dict:
-    for grade in GES_GRADE_SCALE:
-        if grade["min_score"] <= percentage <= grade["max_score"]:
-            return grade
-    return GES_GRADE_SCALE[-1]
+# GES Grading Scale (single shared source — see utils/grade_scale.py)
+GES_GRADE_SCALE = shared_ges_scale.GES_GRADE_SCALE
+get_letter_grade = shared_ges_scale.get_letter_grade
 
 
 async def get_student_record(user: User, session: AsyncSession) -> Student:
@@ -112,16 +120,18 @@ async def get_student_dashboard(
     
     # Get class info
     class_name = None
+    class_level = None
     if student.class_id:
         class_result = await session.execute(select(Class).where(Class.id == student.class_id))
         cls = class_result.scalar_one_or_none()
         class_name = cls.name if cls else None
+        class_level = cls.level if cls else None
     
-    # Get attendance stats (last 30 days)
-    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    # Get attendance stats (last 30 days, by the attendance date itself, not when it was recorded)
+    thirty_days_ago = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
     attendance_query = select(Attendance).where(
         Attendance.student_id == student.id,
-        Attendance.created_at >= thirty_days_ago
+        Attendance.attendance_date >= thirty_days_ago
     )
     
     # Filter by term if provided
@@ -131,7 +141,10 @@ async def get_student_dashboard(
     attendance_result = await session.execute(attendance_query)
     attendance_records = attendance_result.scalars().all()
     
-    present_count = sum(1 for a in attendance_records if a.status == AttendanceStatus.PRESENT)
+    # Late counts as attended, consistent with every other attendance-rate
+    # calculation in the app (student history, parent portal) — this was the
+    # one screen that excluded it, showing a different number for identical data.
+    present_count = sum(1 for a in attendance_records if a.status in (AttendanceStatus.PRESENT, AttendanceStatus.LATE))
     total_days = len(attendance_records)
     attendance_rate = round((present_count / total_days * 100) if total_days > 0 else 0, 1)
     
@@ -145,11 +158,15 @@ async def get_student_dashboard(
     grades_result = await session.execute(grades_query)
     grades = grades_result.scalars().all()
     
-    total_score = sum(g.score for g in grades)
-    total_max = sum(g.max_score for g in grades)
-    overall_avg = round((total_score / total_max * 100) if total_max > 0 else 0, 1)
-    overall_grade = get_letter_grade(overall_avg)
-    
+    # Weighted overall average via compute_overall_ges_score, using the
+    # school's configured CA:exam split (falls back to 50/50) — the same
+    # function report cards use, so this agrees with the report card for
+    # the same term.
+    schemes = await grading_service.get_school_schemes(session, student.school_id)
+    subject_weights = grading_service.build_subject_weights(schemes, class_level, {g.subject_id for g in grades})
+    _, overall_avg = compute_overall_ges_score(grades, weights=subject_weights)
+    overall_grade = get_letter_grade(overall_avg, scale=grading_service.match_scale(schemes, class_level))
+
     # Get fee balance
     fee_query = select(Fee).where(Fee.student_id == student.id)
     
@@ -166,17 +183,25 @@ async def get_student_dashboard(
     fees = fee_result.scalars().all()
     total_due = sum(f.amount_due for f in fees)
     total_paid = sum(f.amount_paid for f in fees)
-    fee_balance = total_due - total_paid
+    total_discount = sum(f.discount for f in fees)
+    fee_balance = max(0, total_due - total_paid - total_discount)
     
     # Get upcoming classes (today's timetable)
-    today = datetime.utcnow().strftime('%A').lower()
-    timetable_result = await session.execute(
-        select(Timetable).where(
-            Timetable.class_id == student.class_id,
-            Timetable.day_of_week == today
+    today_name = datetime.utcnow().strftime('%A').upper()
+    today = DayOfWeek[today_name] if today_name in DayOfWeek.__members__ else None
+    if today is not None:
+        current_term_id = await _get_current_term_id(session, student.school_id)
+        term_filters = [Timetable.academic_term_id == current_term_id] if current_term_id else []
+        timetable_result = await session.execute(
+            select(Timetable).where(
+                Timetable.class_id == student.class_id,
+                Timetable.day_of_week == today,
+                *term_filters
+            )
         )
-    )
-    today_classes = timetable_result.scalars().all()
+        today_classes = timetable_result.scalars().all()
+    else:
+        today_classes = []
     
     # Get recent announcements
     announcement_result = await session.execute(
@@ -232,7 +257,13 @@ async def get_my_grades(
 ):
     """Get student's own grades, optionally filtered by academic term"""
     student = await get_student_record(current_user, session)
-    
+
+    class_level = None
+    if student.class_id:
+        cls = await session.get(Class, student.class_id)
+        class_level = cls.level if cls else None
+    schemes = await grading_service.get_school_schemes(session, student.school_id)
+
     # Build query to get grades
     query = select(Grade).where(Grade.student_id == student.id)
     
@@ -268,7 +299,7 @@ async def get_my_grades(
             }
         
         percentage = round(grade.score / grade.max_score * 100, 1)
-        letter = get_letter_grade(percentage)
+        letter = get_letter_grade(percentage, scale=grading_service.match_scale(schemes, class_level, grade.subject_id))
         
         grades_by_subject[subject_name]["assessments"].append({
             "type": grade.assessment_type,
@@ -282,11 +313,16 @@ async def get_my_grades(
         grades_by_subject[subject_name]["total_score"] += grade.score
         grades_by_subject[subject_name]["total_max"] += grade.max_score
     
-    # Calculate averages and build subjects list
+    # Calculate averages and build subjects list — weighted via
+    # compute_subject_ges_totals/compute_overall_ges_score (same functions
+    # report cards use, using the school's configured CA:exam split, so
+    # this agrees with the report card for the same term).
+    subject_weights = grading_service.build_subject_weights(schemes, class_level, subject_ids)
+    subject_ges_totals = compute_subject_ges_totals(grades, weights=subject_weights)
     subjects_list = []
     for name, data in grades_by_subject.items():
-        avg = round((data["total_score"] / data["total_max"] * 100) if data["total_max"] > 0 else 0, 1)
-        letter = get_letter_grade(avg)
+        avg = subject_ges_totals.get(data["subject_id"], {}).get("total_score", 0.0)
+        letter = get_letter_grade(avg, scale=grading_service.match_scale(schemes, class_level, data["subject_id"]))
         subjects_list.append({
             "subject_name": name,
             "subject_code": data["subject_code"],
@@ -296,16 +332,14 @@ async def get_my_grades(
             "average_description": letter["description"],
             "assessments": sorted(data["assessments"], key=lambda x: x["date"], reverse=True)
         })
-    
+
     # Sort by subject name
     subjects_list.sort(key=lambda x: x["subject_name"])
-    
+
     # Calculate overall average
-    total_score = sum(g.score for g in grades)
-    total_max = sum(g.max_score for g in grades)
-    overall_avg = round((total_score / total_max * 100) if total_max > 0 else 0, 1)
-    overall_grade = get_letter_grade(overall_avg)
-    
+    _, overall_avg = compute_overall_ges_score(grades, weights=subject_weights)
+    overall_grade = get_letter_grade(overall_avg, scale=grading_service.match_scale(schemes, class_level))
+
     return {
         "overall": {
             "average": overall_avg,
@@ -328,10 +362,12 @@ async def get_my_attendance(
     """Get student's own attendance history, optionally filtered by academic term"""
     student = await get_student_record(current_user, session)
     
-    # Build query for attendance
+    # Build query for attendance (filtered by the attendance date itself, not when it was recorded,
+    # so a late correction to an older date doesn't wrongly appear in a "recent days" window)
+    cutoff_date = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
     query = select(Attendance).where(
         Attendance.student_id == student.id,
-        Attendance.created_at >= datetime.utcnow() - timedelta(days=days)
+        Attendance.attendance_date >= cutoff_date
     )
     
     # Filter by term if provided
@@ -410,9 +446,13 @@ async def get_my_timetable(
     )
     periods = {p.id: p for p in periods_result.scalars().all()}
     
-    # Get timetable entries
+    # Get timetable entries, scoped to the current term — without this, entries
+    # from every past term the class has ever had would show up stacked into
+    # the same day/period slots.
+    current_term_id = await _get_current_term_id(session, student.school_id)
+    term_filters = [Timetable.academic_term_id == current_term_id] if current_term_id else []
     timetable_result = await session.execute(
-        select(Timetable).where(Timetable.class_id == student.class_id)
+        select(Timetable).where(Timetable.class_id == student.class_id, *term_filters)
     )
     entries = timetable_result.scalars().all()
     
@@ -518,15 +558,16 @@ async def get_my_fees(
     fees_list = []
     total_due = 0
     total_paid = 0
-    
+    total_discount = 0
+
     for fee in fees:
         structure = structures.get(fee.fee_structure_id)
         fee_payments = [p for p in payments if p.fee_id == fee.id]
-        
+
         # Calculate balance (handle case where discount might be None)
         discount = fee.discount if fee.discount else 0
         balance = fee.amount_due - fee.amount_paid - discount
-        
+
         fees_list.append({
             "id": fee.id,
             "fee_type": structure.fee_type if structure else "unknown",
@@ -540,16 +581,78 @@ async def get_my_fees(
         })
         total_due += fee.amount_due
         total_paid += fee.amount_paid
-    
+        total_discount += discount
+
+    total_balance = max(0, total_due - total_paid - total_discount)
     return {
         "summary": {
             "total_due": total_due,
             "total_paid": total_paid,
-            "balance": total_due - total_paid,
-            "status": "paid" if total_due - total_paid <= 0 else "outstanding"
+            "balance": total_balance,
+            "status": "paid" if total_balance <= 0 else "outstanding"
         },
         "fees": fees_list
     }
+
+
+@router.get("/library", response_model=List[dict])
+async def get_student_library(
+    search: Optional[str] = None,
+    category_id: Optional[str] = None,
+    material_type: Optional[str] = None,
+    current_user: User = Depends(require_roles(UserRole.STUDENT)),
+    session: AsyncSession = Depends(get_session),
+):
+    """Return published library resources visible to the current student."""
+    student = await get_student_record(current_user, session)
+    school_id = student.school_id if hasattr(student, "school_id") else None
+    if not school_id:
+        raise HTTPException(status_code=400, detail="Student school context is missing")
+
+    stmt = select(LibraryItem).where(LibraryItem.school_id == school_id, LibraryItem.is_published == True)
+    if search:
+        search_term = f"%{search.lower()}%"
+        from sqlalchemy import or_
+        stmt = stmt.where(
+            or_(
+                LibraryItem.title.ilike(search_term),
+                LibraryItem.description.ilike(search_term),
+                LibraryItem.tags.ilike(search_term),
+            )
+        )
+    if category_id:
+        stmt = stmt.where(LibraryItem.category_id == category_id)
+    if material_type:
+        stmt = stmt.where(LibraryItem.material_type == material_type)
+
+    result = await session.execute(stmt.order_by(LibraryItem.created_at.desc()))
+    items = result.scalars().all()
+
+    student_class_id = getattr(student, "class_id", None)
+    visible_items = []
+    for item in items:
+        allowed_class_ids = []
+        if item.class_ids:
+            allowed_class_ids = [value.strip() for value in str(item.class_ids).split(",") if value.strip()]
+        if not allowed_class_ids or (student_class_id and student_class_id in allowed_class_ids):
+            visible_items.append(item)
+
+    return [
+        {
+            "id": item.id,
+            "title": item.title,
+            "description": item.description,
+            "material_type": item.material_type,
+            "content_type": item.content_type,
+            "category_id": item.category_id,
+            "class_ids": [value.strip() for value in str(item.class_ids).split(",") if value.strip()] if item.class_ids else [],
+            "file_url": item.file_url,
+            "external_url": item.external_url,
+            "tags": (item.tags.split(",") if item.tags else []),
+            "is_featured": item.is_featured,
+        }
+        for item in visible_items
+    ]
 
 
 @router.get("/announcements", response_model=List[dict])
@@ -589,10 +692,11 @@ async def get_student_announcements(
 @router.get("/assignments/my-assignments", response_model=dict)
 async def get_my_assignments(
     term_id: Optional[str] = None,
+    assignment_id: Optional[str] = None,
     current_user: User = Depends(require_roles(UserRole.STUDENT)),
     session: AsyncSession = Depends(get_session)
 ):
-    """Get all assignments for the current student, optionally filtered by academic term"""
+    """Get assignments for the current student, optionally filtered by academic term or specific assignment ID"""
     student = await get_student_record(current_user, session)
     
     if not student.class_id:
@@ -605,8 +709,11 @@ async def get_my_assignments(
         Assignment.status == AssignmentStatus.PUBLISHED
     )
     
+    # Filter by specific assignment if provided (from module quiz click)
+    if assignment_id:
+        query = query.where(Assignment.id == assignment_id)
     # Filter by term if provided
-    if term_id:
+    elif term_id:
         query = query.where(Assignment.academic_term_id == term_id)
     
     query = query.order_by(Assignment.due_date)
@@ -654,53 +761,14 @@ async def get_my_assignments(
             select(AssignmentQuestion).where(AssignmentQuestion.assignment_id == assignment.id)
         )
         questions = questions_result.scalars().all()
-        
-# Format questions for response
-        formatted_questions = []
-        for q in questions:
-            question_data = {
-                "id": q.id,
-                "question": q.question_text,
-                "type": q.question_type,
-                "answer": q.correct_answer,
-                "points": q.points,
-            }
-            
-            # Parse options if they exist
-            if q.options:
-                try:
-                    if isinstance(q.options, str):
-                        parsed = json.loads(q.options)
-                    else:
-                        parsed = q.options
-                    
-                    # For matching questions, split key=value pairs into options and items
-                    if q.question_type == "matching":
-                        options = []
-                        items = []
-                        for pair in parsed:
-                            if "=" in str(pair):
-                                key, value = str(pair).split("=", 1)
-                                options.append(key)
-                                items.append(value)
-                            else:
-                                options.append(pair)
-                        question_data["options"] = options
-                        question_data["items"] = items
-                    else:
-                        question_data["options"] = parsed
-                        question_data["items"] = []  # Non-matching questions don't have items
-                except:
-                    question_data["options"] = []
-                    question_data["items"] = []
-            else:
-                question_data["options"] = []
-                question_data["items"] = []
-            
-            formatted_questions.append(question_data)
-        
+
         submission = submissions.get(assignment.id)
-        
+        is_graded = submission is not None and submission.status == SubmissionStatus.GRADED
+
+        # Only reveal the correct answer once the submission has been graded,
+        # otherwise a student can read the answer key before attempting it.
+        formatted_questions = format_assignment_questions(questions, reveal_answers=is_graded)
+
         assignment_list.append({
             "id": assignment.id,
             "title": assignment.title,
@@ -755,51 +823,21 @@ async def get_assignment_detail(
         select(AssignmentQuestion).where(AssignmentQuestion.assignment_id == assignment_id)
     )
     questions = questions_result.scalars().all()
-    
-    # Format questions for response
-    formatted_questions = []
-    for q in questions:
-        question_data = {
-            "id": q.id,
-            "question": q.question_text,
-            "type": q.question_type,
-            "answer": q.correct_answer,
-            "points": q.points,
-        }
-        
-        # Parse options if they exist
-        if q.options:
-            try:
-                if isinstance(q.options, str):
-                    parsed = json.loads(q.options)
-                else:
-                    parsed = q.options
-                
-                # For matching questions, split key=value pairs into options and items
-                if q.question_type == "matching":
-                    options = []
-                    items = []
-                    for pair in parsed:
-                        if "=" in str(pair):
-                            key, value = str(pair).split("=", 1)
-                            options.append(key)
-                            items.append(value)
-                        else:
-                            options.append(pair)
-                    question_data["options"] = options
-                    question_data["items"] = items
-                else:
-                    question_data["options"] = parsed
-                    question_data["items"] = []  # Non-matching questions don't have items
-            except:
-                question_data["options"] = []
-                question_data["items"] = []
-        else:
-            question_data["options"] = []
-            question_data["items"] = []
-        
-        formatted_questions.append(question_data)
-    
+
+    # Get student's submission if it exists, so we know whether it's safe to reveal answers
+    submission_result = await session.execute(
+        select(Submission).where(
+            Submission.assignment_id == assignment_id,
+            Submission.student_id == student.id
+        )
+    )
+    submission = submission_result.scalar_one_or_none()
+    is_graded = submission is not None and submission.status == SubmissionStatus.GRADED
+
+    # Only reveal the correct answer once the submission has been graded,
+    # otherwise a student can read the answer key before attempting it.
+    formatted_questions = format_assignment_questions(questions, reveal_answers=is_graded)
+
     # Get teacher name
     teacher_result = await session.execute(
         select(Staff).where(Staff.id == assignment.teacher_id)
@@ -813,16 +851,7 @@ async def get_assignment_detail(
     )
     subject = subject_result.scalar_one_or_none()
     subject_name = subject.name if subject else "Unknown"
-    
-    # Get student's submission if exists
-    submission_result = await session.execute(
-        select(Submission).where(
-            Submission.assignment_id == assignment_id,
-            Submission.student_id == student.id
-        )
-    )
-    submission = submission_result.scalar_one_or_none()
-    
+
     return {
         "assignment": {
             "id": assignment.id,
@@ -880,6 +909,9 @@ async def submit_assignment_file(
     if assignment.class_id != student.class_id or assignment.school_id != student.school_id:
         raise HTTPException(status_code=403, detail="You do not have access to this assignment")
 
+    if assignment.status != AssignmentStatus.PUBLISHED:
+        raise HTTPException(status_code=400, detail="This assignment is not yet published")
+
     existing_submission_result = await session.execute(
         select(Submission).where(
             Submission.assignment_id == assignment_id,
@@ -907,6 +939,9 @@ async def submit_assignment_file(
         f.write(contents)
     file_url = f"/uploads/submissions/{assignment_id}/{safe_name}"
 
+    now = datetime.utcnow()
+    submission_status = resolve_submission_status(assignment.due_date, now)
+
     if not submission:
         submission = Submission(
             id=str(uuid.uuid4()),
@@ -915,9 +950,9 @@ async def submit_assignment_file(
             student_id=student.id,
             class_id=student.class_id,
             subject_id=assignment.subject_id,
-            status=SubmissionStatus.SUBMITTED,
+            status=submission_status,
             submission_urls=json.dumps([file_url]),
-            submission_date=datetime.utcnow(),
+            submission_date=now,
             max_score=assignment.points_possible
         )
         session.add(submission)
@@ -925,8 +960,8 @@ async def submit_assignment_file(
         existing_urls = json.loads(submission.submission_urls) if submission.submission_urls else []
         existing_urls.append(file_url)
         submission.submission_urls = json.dumps(existing_urls)
-        submission.status = SubmissionStatus.SUBMITTED
-        submission.submission_date = datetime.utcnow()
+        submission.status = submission_status
+        submission.submission_date = now
 
     await session.commit()
     await session.refresh(submission)
@@ -966,11 +1001,14 @@ async def submit_assignment(
     
     if not assignment:
         raise HTTPException(status_code=404, detail="Assignment not found")
-    
+
     # Verify student has access to this assignment
     if assignment.class_id != student.class_id or assignment.school_id != student.school_id:
         raise HTTPException(status_code=403, detail="You do not have access to this assignment")
-    
+
+    if assignment.status != AssignmentStatus.PUBLISHED:
+        raise HTTPException(status_code=400, detail="This assignment is not yet published")
+
     # Check if assignment is already graded - prevent resubmission
     existing_submission_result = await session.execute(
         select(Submission).where(
@@ -1013,9 +1051,13 @@ async def submit_assignment(
                         questions,
                         float(assignment.points_possible or 100)
                     )
-            except:
-                pass  # Continue without auto-grading if it fails
-    
+            except Exception as e:
+                logger.warning(f"Auto-grading failed for assignment {assignment_id}, student {student.id}: {e}")
+                auto_grade_data = None  # Continue without auto-grading if it fails
+
+    now = datetime.utcnow()
+    submission_status = resolve_submission_status(assignment.due_date, now)
+
     # Get or create submission
     submission_result = await session.execute(
         select(Submission).where(
@@ -1024,7 +1066,7 @@ async def submit_assignment(
         )
     )
     submission = submission_result.scalar_one_or_none()
-    
+
     if not submission:
         # Create new submission
         submission = Submission(
@@ -1034,17 +1076,17 @@ async def submit_assignment(
             student_id=student.id,
             class_id=student.class_id,
             subject_id=assignment.subject_id,
-            status=SubmissionStatus.SUBMITTED,
+            status=submission_status,
             submission_text=answers_json or submission_text,
-            submission_date=datetime.utcnow(),
+            submission_date=now,
             max_score=assignment.points_possible
         )
         session.add(submission)
     else:
         # Update existing submission
         submission.submission_text = answers_json or submission_text
-        submission.status = SubmissionStatus.SUBMITTED
-        submission.submission_date = datetime.utcnow()
+        submission.status = submission_status
+        submission.submission_date = now
     
     # If auto-graded, set the score
     if auto_grade_data and auto_grade_data.get("can_full_auto_grade"):
@@ -1057,7 +1099,8 @@ async def submit_assignment(
             "question_scores": auto_grade_data["question_scores"],
             "feedback": auto_grade_data["feedback"]
         })
-    
+        await sync_submission_to_grade(session, submission, assignment, recorded_by="system:auto-grade")
+
     await session.commit()
     await session.refresh(submission)
     
@@ -1111,7 +1154,7 @@ async def get_enrollment_status(
             StudentTransport.is_active == True
         )
     )
-    has_transport = transport_result.scalar_one_or_none() is not None
+    has_transport = transport_result.scalars().first() is not None
     
     return {
         "has_hostel": has_hostel,
@@ -1183,6 +1226,153 @@ async def get_hostel_status(
     }
 
 
+# ============================================================================
+# COURSE MODULES - Lightweight LMS (read-only for students + completion toggle)
+# ============================================================================
+
+@router.get("/course-modules", response_model=List[dict])
+async def list_my_course_modules(
+    current_user: User = Depends(require_roles(UserRole.STUDENT)),
+    session: AsyncSession = Depends(get_session)
+):
+    """Published course modules for the student's current class, with each
+    item's completion status. Quiz/assessment items (assignment_id set)
+    derive "completed" from the student's Submission — self-reporting a
+    quiz as watched/done doesn't make sense — and carry the assignment's
+    title/due date/the student's score if graded. Video/material items
+    keep the manual StudentModuleProgress checkmark."""
+    student = await get_student_record(current_user, session)
+
+    if not student.class_id:
+        return []
+
+    modules_result = await session.execute(
+        select(CourseModule).where(
+            CourseModule.school_id == student.school_id,
+            CourseModule.class_id == student.class_id,
+            CourseModule.is_published == True,
+        ).order_by(CourseModule.order_index, CourseModule.created_at)
+    )
+    modules = modules_result.scalars().all()
+    module_ids = [m.id for m in modules]
+    if not module_ids:
+        return []
+
+    items_result = await session.execute(
+        select(CourseModuleItem)
+        .where(CourseModuleItem.module_id.in_(module_ids))
+        .order_by(CourseModuleItem.order_index, CourseModuleItem.created_at)
+    )
+    items = items_result.scalars().all()
+    item_ids = [i.id for i in items]
+
+    completed_item_ids = set()
+    progress_item_ids = [i.id for i in items if not i.assignment_id]
+    if progress_item_ids:
+        progress_result = await session.execute(
+            select(StudentModuleProgress.module_item_id).where(
+                StudentModuleProgress.student_id == student.id,
+                StudentModuleProgress.module_item_id.in_(progress_item_ids),
+            )
+        )
+        completed_item_ids = {row[0] for row in progress_result.all()}
+
+    assignment_ids = [i.assignment_id for i in items if i.assignment_id]
+    assignments_by_id = {}
+    submissions_by_assignment = {}
+    if assignment_ids:
+        assignments_result = await session.execute(
+            select(Assignment).where(Assignment.id.in_(assignment_ids))
+        )
+        assignments_by_id = {a.id: a for a in assignments_result.scalars().all()}
+
+        submissions_result = await session.execute(
+            select(Submission).where(
+                Submission.student_id == student.id,
+                Submission.assignment_id.in_(assignment_ids),
+            )
+        )
+        submissions_by_assignment = {s.assignment_id: s for s in submissions_result.scalars().all()}
+
+    items_by_module = {}
+    for item in items:
+        entry = {**jsonable_encoder(item)}
+        if item.assignment_id:
+            assignment = assignments_by_id.get(item.assignment_id)
+            submission = submissions_by_assignment.get(item.assignment_id)
+            entry["completed"] = submission is not None and submission.status != SubmissionStatus.NOT_SUBMITTED
+            entry["assignment"] = {
+                "id": assignment.id,
+                "title": assignment.title,
+                "due_date": assignment.due_date.isoformat() if assignment and assignment.due_date else None,
+                "points_possible": assignment.points_possible if assignment else None,
+            } if assignment else None
+            entry["submission_status"] = submission.status if submission else "not_submitted"
+            entry["score"] = submission.score if submission else None
+        else:
+            entry["completed"] = item.id in completed_item_ids
+        items_by_module.setdefault(item.module_id, []).append(entry)
+
+    return [
+        {**jsonable_encoder(m), "items": items_by_module.get(m.id, [])}
+        for m in modules
+    ]
+
+
+@router.post("/course-modules/items/{item_id}/complete", response_model=dict)
+async def complete_module_item(
+    item_id: str,
+    current_user: User = Depends(require_roles(UserRole.STUDENT)),
+    session: AsyncSession = Depends(get_session)
+):
+    """Mark a module item complete (idempotent)."""
+    student = await get_student_record(current_user, session)
+
+    item_result = await session.execute(
+        select(CourseModuleItem).where(CourseModuleItem.id == item_id, CourseModuleItem.school_id == student.school_id)
+    )
+    item = item_result.scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="Module item not found")
+    if item.assignment_id:
+        raise HTTPException(status_code=400, detail="This item is a quiz/assignment — completion is determined by your submission, not marked manually")
+
+    existing_result = await session.execute(
+        select(StudentModuleProgress).where(
+            StudentModuleProgress.student_id == student.id,
+            StudentModuleProgress.module_item_id == item_id,
+        )
+    )
+    if existing_result.scalar_one_or_none():
+        return {"success": True, "completed": True}
+
+    session.add(StudentModuleProgress(school_id=student.school_id, student_id=student.id, module_item_id=item_id))
+    await session.commit()
+    return {"success": True, "completed": True}
+
+
+@router.delete("/course-modules/items/{item_id}/complete", response_model=dict)
+async def uncomplete_module_item(
+    item_id: str,
+    current_user: User = Depends(require_roles(UserRole.STUDENT)),
+    session: AsyncSession = Depends(get_session)
+):
+    """Unmark a module item as complete."""
+    student = await get_student_record(current_user, session)
+
+    existing_result = await session.execute(
+        select(StudentModuleProgress).where(
+            StudentModuleProgress.student_id == student.id,
+            StudentModuleProgress.module_item_id == item_id,
+        )
+    )
+    progress = existing_result.scalar_one_or_none()
+    if progress:
+        await session.delete(progress)
+        await session.commit()
+    return {"success": True, "completed": False}
+
+
 @router.get("/transport/status", response_model=dict)
 async def get_transport_status(
     current_user: User = Depends(require_roles(UserRole.STUDENT)),
@@ -1192,13 +1382,16 @@ async def get_transport_status(
     student = await get_student_record(current_user, session)
     
     transport_result = await session.execute(
-        select(StudentTransport).where(
+        select(StudentTransport)
+        .where(
             StudentTransport.student_id == student.id,
             StudentTransport.school_id == student.school_id,
             StudentTransport.is_active == True
         )
+        .order_by(StudentTransport.updated_at.desc(), StudentTransport.created_at.desc())
+        .limit(1)
     )
-    transport = transport_result.scalar_one_or_none()
+    transport = transport_result.scalars().first()
     
     if not transport:
         raise HTTPException(status_code=404, detail="Not enrolled in transport")

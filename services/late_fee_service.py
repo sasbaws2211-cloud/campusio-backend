@@ -12,51 +12,72 @@ from typing import Dict, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from typing import List
 from models.billing import (
-    PlatformSubscription, LateFeeCharge, BillingConfiguration, SubscriptionStatus
+    PlatformSubscription, LateFeeCharge, BillingConfiguration, SubscriptionStatus,
+    SubscriptionInvoice
 )
+from services.platform_billing_service import subscription_outstanding
 
 logger = logging.getLogger(__name__)
 
 
+def calculate_late_fee(
+    outstanding_balance: float,
+    late_fee_percentage: float,
+    max_late_fee: Optional[float] = None
+) -> float:
+    """Pure late-fee calculation: percentage of outstanding balance, capped
+    at max_late_fee if configured. Shared by apply_late_fee and its tests."""
+    fee = (outstanding_balance * late_fee_percentage) / 100
+    if max_late_fee is not None and fee > max_late_fee:
+        fee = max_late_fee
+    return round(fee, 2)
+
+
 class LateFeeService:
     """Manages late fee calculation and application"""
-    
+
     async def check_and_apply_late_fees(
         self,
         session: AsyncSession,
-        school_id: str
+        school_id: Optional[str] = None
     ) -> Dict:
         """
-        Check all subscriptions and apply late fees if applicable
-        
+        Check overdue subscriptions and apply late fees if applicable.
+
+        school_id=None checks every school (each against its own billing
+        configuration) — mirrors SubscriptionSuspensionService.
+        check_and_suspend_overdue, which the /late-fees/apply endpoint calls
+        the exact same way for a super admin (who has no school_id of their
+        own). Previously this required a concrete school_id, so the
+        platform-wide "apply late fees" action silently matched zero rows.
+
         Returns count of subscriptions with late fees applied
         """
         try:
-            # Get billing configuration
-            config = await self._get_config(session, school_id)
-            if not config or not config.enable_late_fees:
-                return {"success": False, "message": "Late fees disabled"}
-            
-            # Get all overdue subscriptions without late fees
-            result = await session.execute(
-                select(PlatformSubscription).where(
-                    PlatformSubscription.school_id == school_id,
-                    PlatformSubscription.status.in_([
-                        SubscriptionStatus.PENDING,
-                        SubscriptionStatus.SUSPENDED
-                    ]),
-                    PlatformSubscription.amount_paid < PlatformSubscription.total_amount_due,
-                    PlatformSubscription.late_fee_amount == 0.0  # Not yet charged
-                )
+            query = select(PlatformSubscription).where(
+                PlatformSubscription.status.in_([
+                    SubscriptionStatus.PENDING,
+                    SubscriptionStatus.SUSPENDED
+                ]),
+                PlatformSubscription.amount_paid < PlatformSubscription.total_amount_due,
+                PlatformSubscription.late_fee_amount == 0.0  # Not yet charged
             )
+            if school_id:
+                query = query.where(PlatformSubscription.school_id == school_id)
+            result = await session.execute(query)
             subscriptions = result.scalars().all()
-            
+
             count = 0
             for sub in subscriptions:
+                config = await self._get_config(session, sub.school_id)
+                if not config or not config.enable_late_fees:
+                    continue
+
                 # Check if subscription is past grace period
                 days_overdue = (datetime.utcnow() - sub.due_date).days
-                
+
                 if days_overdue > config.grace_period_days:
                     # Apply late fee
                     apply_result = await self.apply_late_fee(
@@ -65,18 +86,18 @@ class LateFeeService:
                         config.late_fee_percentage,
                         config.max_late_fee
                     )
-                    
+
                     if apply_result.get("success"):
                         count += 1
-            
+
             await session.commit()
-            
+
             return {
                 "success": True,
                 "subscriptions_with_late_fees": count,
                 "message": f"Applied late fees to {count} subscriptions"
             }
-            
+
         except Exception as e:
             logger.error(f"Error applying late fees: {str(e)}")
             await session.rollback()
@@ -111,17 +132,11 @@ class LateFeeService:
             
             # Calculate late fee
             outstanding_balance = subscription.total_amount_due - subscription.amount_paid
-            
+
             if outstanding_balance <= 0:
                 return {"success": False, "error": "No outstanding balance"}
-            
-            late_fee = (outstanding_balance * late_fee_percentage) / 100
-            
-            # Apply cap if configured
-            if max_late_fee and late_fee > max_late_fee:
-                late_fee = max_late_fee
-            
-            late_fee = round(late_fee, 2)
+
+            late_fee = calculate_late_fee(outstanding_balance, late_fee_percentage, max_late_fee)
 
             # Update subscription. Derive from total_amount_due directly
             # rather than after_discount, which is 0.0 on rows generated
@@ -221,6 +236,60 @@ class LateFeeService:
             await session.rollback()
             return {"success": False, "error": str(e)}
     
+    async def get_overdue_subscriptions(
+        self,
+        session: AsyncSession,
+        school_id: Optional[str] = None
+    ) -> List[Dict]:
+        """List subscriptions past their due date with a balance still
+        outstanding — the data source for the late-fee admin dashboard.
+
+        school_id=None lists across every school (super admin view).
+        """
+        try:
+            query = select(PlatformSubscription).where(
+                PlatformSubscription.status != SubscriptionStatus.CANCELLED,
+                PlatformSubscription.due_date <= datetime.utcnow(),
+            )
+            if school_id:
+                query = query.where(PlatformSubscription.school_id == school_id)
+            result = await session.execute(query.order_by(PlatformSubscription.due_date))
+            subscriptions = [s for s in result.scalars().all() if subscription_outstanding(s) > 0]
+
+            if not subscriptions:
+                return []
+
+            invoice_ids = [s.invoice_id for s in subscriptions if s.invoice_id]
+            invoice_numbers: Dict[str, str] = {}
+            if invoice_ids:
+                inv_result = await session.execute(
+                    select(SubscriptionInvoice.id, SubscriptionInvoice.invoice_number).where(
+                        SubscriptionInvoice.id.in_(invoice_ids)
+                    )
+                )
+                invoice_numbers = {row[0]: row[1] for row in inv_result.all()}
+
+            now = datetime.utcnow()
+            return [
+                {
+                    "subscription_id": sub.id,
+                    "school_id": sub.school_id,
+                    "invoice_number": invoice_numbers.get(sub.invoice_id),
+                    "due_date": sub.due_date.isoformat(),
+                    "days_overdue": (now - sub.due_date).days,
+                    "total_amount_due": sub.total_amount_due,
+                    "amount_paid": sub.amount_paid,
+                    "late_fee_amount": sub.late_fee_amount,
+                    "outstanding": subscription_outstanding(sub),
+                    "status": sub.status.value if hasattr(sub.status, "value") else sub.status,
+                }
+                for sub in subscriptions
+            ]
+
+        except Exception as e:
+            logger.error(f"Error fetching overdue subscriptions: {str(e)}")
+            return []
+
     async def get_late_fee_details(
         self,
         session: AsyncSession,

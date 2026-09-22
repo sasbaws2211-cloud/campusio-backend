@@ -15,8 +15,13 @@ from datetime import datetime
 
 from services.reversal_service import ReversalService, ReversalError
 from dependencies import get_current_school_id
-from auth import get_current_user 
+from auth import get_current_user, require_roles
 from database import get_session
+from models.user import User, UserRole
+
+# Reversing a posted entry is a GL-affecting write — same role gate as
+# journal.py's own reverse endpoint.
+FINANCE_ADMIN_ROLES = (UserRole.SUPER_ADMIN, UserRole.SCHOOL_ADMIN, UserRole.HR)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/reversals", tags=["Reversals"])
@@ -48,7 +53,7 @@ class AccountReversalRequest(SQLModel):
 async def reverse_full_entry(
     entry_id: str,
     body: FullReversalRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
     request: Request = None,
@@ -80,20 +85,22 @@ async def reverse_full_entry(
         service = ReversalService(session)
         
         ip_address = request.client.host if request else None
-        user_role = current_user.get("role", "finance")
-        
+        user_role = current_user.role.value if current_user.role else "finance"
+        user_name = f"{current_user.first_name} {current_user.last_name}"
+
         original_entry, reversal_entry = await service.reverse_full_entry(
             school_id=school_id,
             entry_id=entry_id,
-            reversed_by=current_user.get("id", "unknown"),
+            reversed_by=current_user.id,
             reversal_reason=reversal_reason,
             reversal_notes=reversal_notes,
             ip_address=ip_address,
             user_role=user_role,
+            user_name=user_name,
         )
-        
+
         logger.info(
-            f"Full reversal of entry {entry_id} completed by {current_user.get('id')} "
+            f"Full reversal of entry {entry_id} completed by {current_user.id} "
             f"(reason: {reversal_reason})"
         )
         
@@ -126,7 +133,7 @@ async def reverse_full_entry(
 async def reverse_partial_entry(
     entry_id: str,
     body: PartialReversalRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
     request: Request = None,
@@ -162,22 +169,24 @@ async def reverse_partial_entry(
         service = ReversalService(session)
         
         ip_address = request.client.host if request else None
-        user_role = current_user.get("role", "finance")
-        
+        user_role = current_user.role.value if current_user.role else "finance"
+        user_name = f"{current_user.first_name} {current_user.last_name}"
+
         original_entry, reversal_entry = await service.reverse_partial_entry(
             school_id=school_id,
             entry_id=entry_id,
             line_numbers=line_numbers,
-            reversed_by=current_user.get("id", "unknown"),
+            reversed_by=current_user.id,
             reversal_reason=reversal_reason,
             reversal_notes=reversal_notes,
             ip_address=ip_address,
             user_role=user_role,
+            user_name=user_name,
         )
-        
+
         logger.info(
             f"Partial reversal of entry {entry_id} (lines: {line_numbers}) "
-            f"completed by {current_user.get('id')}"
+            f"completed by {current_user.id}"
         )
         
         return {
@@ -201,7 +210,7 @@ async def reverse_partial_entry(
 async def reverse_specific_accounts(
     entry_id: str,
     body: AccountReversalRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
     request: Request = None,
@@ -236,22 +245,24 @@ async def reverse_specific_accounts(
         service = ReversalService(session)
         
         ip_address = request.client.host if request else None
-        user_role = current_user.get("role", "finance")
-        
+        user_role = current_user.role.value if current_user.role else "finance"
+        user_name = f"{current_user.first_name} {current_user.last_name}"
+
         original_entry, reversal_entry = await service.reverse_specific_accounts(
             school_id=school_id,
             entry_id=entry_id,
             account_ids=account_ids,
-            reversed_by=current_user.get("id", "unknown"),
+            reversed_by=current_user.id,
             reversal_reason=reversal_reason,
             reversal_notes=reversal_notes,
             ip_address=ip_address,
             user_role=user_role,
+            user_name=user_name,
         )
-        
+
         logger.info(
             f"Account-specific reversal of entry {entry_id} (accounts: {account_ids}) "
-            f"by {current_user.get('id')}"
+            f"by {current_user.id}"
         )
         
         return {

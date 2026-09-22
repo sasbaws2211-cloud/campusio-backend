@@ -75,114 +75,153 @@ async def seed_transport_data():
         
         await session.flush()
         
-        # Create vehicles
-        vehicle1 = Vehicle(
-            school_id=school.id,
-            registration_number="GR-123-20",
-            vehicle_type="bus",
-            make="Hyundai",
-            model="H350",
-            year=2022,
-            color="Yellow",
-            seating_capacity=45,
-            current_occupancy=0,
-            driver_id=driver_staff.id,
-            conductor_id=conductor_staff.id,
-            insurance_expiry="2025-12-31",
-            roadworthiness_expiry="2025-06-30",
-            status="active",
-            notes="Main school transport bus"
-        )
-        session.add(vehicle1)
-        
-        vehicle2 = Vehicle(
-            school_id=school.id,
-            registration_number="GR-124-20",
-            vehicle_type="minibus",
-            make="Toyota",
-            model="Hiace",
-            year=2021,
-            color="White",
-            seating_capacity=25,
-            current_occupancy=0,
-            driver_id=None,
-            conductor_id=None,
-            insurance_expiry="2025-12-31",
-            roadworthiness_expiry="2025-06-30",
-            status="active",
-            notes="Secondary route transport"
-        )
-        session.add(vehicle2)
-        
+        # Create or reuse driver staff records in driver_staff table so vehicles can reference them
+        # Prefer lookup by staff_id, fall back to license_number, otherwise create new
+        result = await session.exec(select(DriverStaff).where(DriverStaff.staff_id == driver_staff.id))
+        driver_record = result.first()
+        if not driver_record:
+            result = await session.exec(select(DriverStaff).where(DriverStaff.license_number == "DL-2023-001"))
+            driver_record = result.first()
+        if not driver_record:
+            driver_record = DriverStaff(
+                school_id=school.id,
+                staff_id=driver_staff.id,
+                license_number="DL-2023-001",
+                license_expiry="2026-12-31",
+                role="driver",
+                insurance_provider="National Insurance",
+                insurance_expiry="2025-12-31",
+                is_verified=True
+            )
+            session.add(driver_record)
+
+        result = await session.exec(select(DriverStaff).where(DriverStaff.staff_id == conductor_staff.id))
+        conductor_record = result.first()
+        if not conductor_record:
+            result = await session.exec(select(DriverStaff).where(DriverStaff.license_number == "CD-2023-001"))
+            conductor_record = result.first()
+        if not conductor_record:
+            conductor_record = DriverStaff(
+                school_id=school.id,
+                staff_id=conductor_staff.id,
+                license_number="CD-2023-001",
+                license_expiry="2026-12-31",
+                role="conductor",
+                insurance_provider="National Insurance",
+                insurance_expiry="2025-12-31",
+                is_verified=True
+            )
+            session.add(conductor_record)
+
+        await session.flush()
+
+        # Create or reuse vehicles (idempotent by registration_number)
+        result = await session.exec(select(Vehicle).where(Vehicle.registration_number == "GR-123-20"))
+        vehicle1 = result.first()
+        if not vehicle1:
+            vehicle1 = Vehicle(
+                school_id=school.id,
+                registration_number="GR-123-20",
+                vehicle_type="bus",
+                make="Hyundai",
+                model="H350",
+                year=2022,
+                color="Yellow",
+                seating_capacity=45,
+                current_occupancy=0,
+                driver_id=driver_record.id,
+                conductor_id=conductor_record.id,
+                insurance_expiry="2025-12-31",
+                roadworthiness_expiry="2025-06-30",
+                status="active",
+                notes="Main school transport bus"
+            )
+            session.add(vehicle1)
+        else:
+            # ensure driver/conductor links exist
+            if not vehicle1.driver_id:
+                vehicle1.driver_id = driver_record.id
+            if not vehicle1.conductor_id:
+                vehicle1.conductor_id = conductor_record.id
+
+        result = await session.exec(select(Vehicle).where(Vehicle.registration_number == "GR-124-20"))
+        vehicle2 = result.first()
+        if not vehicle2:
+            vehicle2 = Vehicle(
+                school_id=school.id,
+                registration_number="GR-124-20",
+                vehicle_type="minibus",
+                make="Toyota",
+                model="Hiace",
+                year=2021,
+                color="White",
+                seating_capacity=25,
+                current_occupancy=0,
+                driver_id=None,
+                conductor_id=None,
+                insurance_expiry="2025-12-31",
+                roadworthiness_expiry="2025-06-30",
+                status="active",
+                notes="Secondary route transport"
+            )
+            session.add(vehicle2)
+
         await session.flush()
         
-        # Create transport routes
-        route1 = Route(
-            school_id=school.id,
-            route_name="Downtown Route",
-            route_code="RT001",
-            start_point="Labadi Beach",
-            end_point="School Gate",
-            distance_km=15.5,
-            estimated_duration_minutes=45,
-            vehicle_id=vehicle1.id,
-            pickup_time="07:00",
-            dropoff_time="08:30",
-            pickup_days='["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]',
-            intermediate_stops='["Osu Junction", "Cantonments Market", "Airport Roundabout"]',
-            student_count=0,
-            fee_amount=50.0,
-            status="active"
-        )
-        session.add(route1)
-        
-        route2 = Route(
-            school_id=school.id,
-            route_name="East Legon Route",
-            route_code="RT002",
-            start_point="East Legon",
-            end_point="School Gate",
-            distance_km=12.0,
-            estimated_duration_minutes=35,
-            vehicle_id=vehicle2.id,
-            pickup_time="07:15",
-            dropoff_time="08:45",
-            pickup_days='["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]',
-            intermediate_stops='["Tetteh Quarshie Interchange", "Achimota School"]',
-            student_count=0,
-            fee_amount=45.0,
-            status="active"
-        )
-        session.add(route2)
-        
+        # Create or reuse transport routes (idempotent by route_code)
+        result = await session.exec(select(Route).where(Route.route_code == "RT001"))
+        route1 = result.first()
+        if not route1:
+            route1 = Route(
+                school_id=school.id,
+                route_name="Downtown Route",
+                route_code="RT001",
+                start_point="Labadi Beach",
+                end_point="School Gate",
+                distance_km=15.5,
+                estimated_duration_minutes=45,
+                vehicle_id=vehicle1.id,
+                pickup_time="07:00",
+                dropoff_time="08:30",
+                pickup_days='["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]',
+                intermediate_stops='["Osu Junction", "Cantonments Market", "Airport Roundabout"]',
+                student_count=0,
+                fee_amount=50.0,
+                status="active"
+            )
+            session.add(route1)
+        else:
+            if not route1.vehicle_id:
+                route1.vehicle_id = vehicle1.id
+
+        result = await session.exec(select(Route).where(Route.route_code == "RT002"))
+        route2 = result.first()
+        if not route2:
+            route2 = Route(
+                school_id=school.id,
+                route_name="East Legon Route",
+                route_code="RT002",
+                start_point="East Legon",
+                end_point="School Gate",
+                distance_km=12.0,
+                estimated_duration_minutes=35,
+                vehicle_id=vehicle2.id,
+                pickup_time="07:15",
+                dropoff_time="08:45",
+                pickup_days='["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]',
+                intermediate_stops='["Tetteh Quarshie Interchange", "Achimota School"]',
+                student_count=0,
+                fee_amount=45.0,
+                status="active"
+            )
+            session.add(route2)
+        else:
+            if not route2.vehicle_id:
+                route2.vehicle_id = vehicle2.id
+
         await session.flush()
         
-        # Create driver staff records
-        driver_record = DriverStaff(
-            school_id=school.id,
-            staff_id=driver_staff.id,
-            license_number="DL-2023-001",
-            license_expiry="2026-12-31",
-            role="driver",
-            insurance_provider="National Insurance",
-            insurance_expiry="2025-12-31",
-            is_verified=True
-        )
-        session.add(driver_record)
-        
-        conductor_record = DriverStaff(
-            school_id=school.id,
-            staff_id=conductor_staff.id,
-            license_number="CD-2023-001",
-            license_expiry="2026-12-31",
-            role="conductor",
-            insurance_provider="National Insurance",
-            insurance_expiry="2025-12-31",
-            is_verified=True
-        )
-        session.add(conductor_record)
-        
-        await session.flush()
+        # driver_record and conductor_record were created earlier before vehicles
         
         # Create student transport enrollment
         student_transport = StudentTransport(

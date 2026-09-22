@@ -7,36 +7,22 @@ from sqlmodel import select
 from statistics import mean
 from dateutil import parser as date_parser
 
-from models.assignment import Assignment, Submission, SubmissionStatus
+from models.assignment import Assignment, Submission, SubmissionStatus, CourseModule, CourseModuleItem
 from models.grade import Grade
-from models.classroom import Subject
+from models.classroom import Class, Subject
+from utils.grade_scale import get_letter_grade
+from services import grading_service
+from services.report_card_pdf_service import compute_subject_ges_totals
 
 logger = logging.getLogger(__name__)
 
-# GES Grading Scale (Ghana Education Service)
-GES_GRADE_SCALE = [
-    {"grade": "1", "min_score": 80, "max_score": 100, "description": "Excellent"},
-    {"grade": "2", "min_score": 70, "max_score": 79, "description": "Very Good"},
-    {"grade": "3", "min_score": 60, "max_score": 69, "description": "Good"},
-    {"grade": "4", "min_score": 55, "max_score": 59, "description": "Credit"},
-    {"grade": "5", "min_score": 50, "max_score": 54, "description": "Pass"},
-    {"grade": "6", "min_score": 45, "max_score": 49, "description": "Weak Pass"},
-    {"grade": "7", "min_score": 40, "max_score": 44, "description": "Very Weak"},
-    {"grade": "8", "min_score": 35, "max_score": 39, "description": "Poor"},
-    {"grade": "9", "min_score": 0, "max_score": 34, "description": "Fail"},
-]
 
-
-def get_ges_grade(percentage: float) -> Tuple[str, str]:
-    """Convert percentage to GES grade and description"""
-    if percentage is None or percentage < 0:
-        return "9", "Fail"
-    
-    for grade_info in GES_GRADE_SCALE:
-        if grade_info["min_score"] <= percentage <= grade_info["max_score"]:
-            return grade_info["grade"], grade_info["description"]
-    
-    return "9", "Fail"
+def get_ges_grade(percentage: float, scale: list = None) -> Tuple[str, str]:
+    """Convert percentage to grade and description. scale defaults to the
+    built-in GES scale — pass a school-configured one (services/grading_service.py)
+    to support the multiple grading systems feature."""
+    band = get_letter_grade(percentage, scale=scale)
+    return band["grade"], band["description"]
 
 
 def calculate_trend_direction(scores: List[float]) -> str:
@@ -77,7 +63,7 @@ class AssignmentPerformanceService:
     
     # ==================== Metric 1: Assignment Performance Index ====================
     
-    async def calculate_api(self, submissions: List[Submission]) -> Dict:
+    async def calculate_api(self, submissions: List[Submission], scale: list = None) -> Dict:
         """
         Calculate Assignment Performance Index (API)
         
@@ -120,7 +106,7 @@ class AssignmentPerformanceService:
             }
         
         percentage = (total_earned / total_possible) * 100
-        grade, description = get_ges_grade(percentage)
+        grade, description = get_ges_grade(percentage, scale=scale)
         
         # Calculate trend
         scores = [s.score for s in graded_submissions]
@@ -144,10 +130,17 @@ class AssignmentPerformanceService:
     
     # ==================== Metric 2: Subject-Wise Performance ====================
     
-    async def calculate_subject_performance(self, grades: List[Grade], session: AsyncSession) -> Dict:
+    async def calculate_subject_performance(
+        self, grades: List[Grade], session: AsyncSession, schemes: list = None, class_level: str = None
+    ) -> Dict:
         """
         Calculate performance by subject
-        
+
+        schemes/class_level: from services.grading_service.get_school_schemes()
+        — each subject's grade is matched against the most specific configured
+        scheme for (class_level, that subject_id), falling back to the GES
+        scale when nothing's configured.
+
         Returns:
             Dict mapping subject names to their performance stats
         """
@@ -178,13 +171,20 @@ class AssignmentPerformanceService:
                 subject_name = data["subject_name"]
             
             scores = [g.score for g in data["grades"] if g.score is not None]
-            
+
             if not scores:
                 continue
-            
-            avg_score = mean(scores)
-            grade, description = get_ges_grade(avg_score)
-            trend = calculate_trend_direction(scores)
+
+            # GES-split, weighted percentage via compute_subject_ges_totals —
+            # the same function report cards use, so this agrees with the
+            # report card for the same subject/term. Previously a raw mean
+            # of Grade.score fed straight into grade-banding as if it were
+            # already a percentage — wrong whenever max_score varies between
+            # assessments (e.g. a 18/20 quiz was banded as "18%").
+            avg_score = compute_subject_ges_totals(data["grades"]).get(subject_id, {}).get("total_score", 0.0)
+            subject_scale = grading_service.match_scale(schemes or [], class_level, subject_id)
+            grade, description = get_ges_grade(avg_score, scale=subject_scale)
+            trend = calculate_trend_direction([round(g.score / g.max_score * 100, 1) for g in data["grades"] if g.score is not None and g.max_score])
             
             result[subject_name] = {
                 "average_score": round(avg_score, 1),
@@ -247,7 +247,7 @@ class AssignmentPerformanceService:
     
     # ==================== Metric 4: Assessment Type Breakdown ====================
     
-    async def calculate_assessment_type_breakdown(self, grades: List[Grade]) -> Dict:
+    async def calculate_assessment_type_breakdown(self, grades: List[Grade], scale: list = None) -> Dict:
         """
         Calculate performance by assessment type
         (classwork, homework, quiz, project, worksheet, etc.)
@@ -258,15 +258,20 @@ class AssignmentPerformanceService:
         if not grades:
             return {}
         
-        # Group grades by assessment type
+        # Group grades by assessment type. Scores are stored as each grade's
+        # own percentage (score/max_score*100), not raw points — a raw mean
+        # here would silently mix assessments with different max_score
+        # values (e.g. a 20-point quiz and a 100-point exam) into one
+        # meaningless number, then band it as if it were already a
+        # percentage.
         types = {}
         for grade in grades:
             atype = grade.assessment_type  # from models
             if atype not in types:
                 types[atype] = {"scores": [], "count": 0}
-            
-            if grade.score is not None:
-                types[atype]["scores"].append(grade.score)
+
+            if grade.score is not None and grade.max_score:
+                types[atype]["scores"].append(round(grade.score / grade.max_score * 100, 1))
                 types[atype]["count"] += 1
         
         result = {}
@@ -276,8 +281,8 @@ class AssignmentPerformanceService:
             if atype in types and types[atype]["scores"]:
                 scores = types[atype]["scores"]
                 avg = mean(scores)
-                grade, description = get_ges_grade(avg)
-                
+                grade, description = get_ges_grade(avg, scale=scale)
+
                 result[atype] = {
                     "average": round(avg, 1),
                     "count": types[atype]["count"],
@@ -291,8 +296,8 @@ class AssignmentPerformanceService:
             if atype not in result and data["scores"]:
                 scores = data["scores"]
                 avg = mean(scores)
-                grade, description = get_ges_grade(avg)
-                
+                grade, description = get_ges_grade(avg, scale=scale)
+
                 result[atype] = {
                     "average": round(avg, 1),
                     "count": data["count"],
@@ -321,10 +326,14 @@ class AssignmentPerformanceService:
         if not term_start_date:
             term_start_date = datetime.utcnow()
         
-        # Filter to graded submissions with dates
+        # Filter to graded submissions with dates and a usable max_score —
+        # same normalization gap already fixed in calculate_subject_performance/
+        # calculate_assessment_type_breakdown: a raw mean of Submission.score
+        # silently mixes assignments with different max_score values (a 20-point
+        # quiz and a 100-point exam) into one meaningless number.
         graded_subs = [
-            s for s in submissions 
-            if s.score is not None and s.graded_date
+            s for s in submissions
+            if s.score is not None and s.graded_date and s.max_score
         ]
         
         if not graded_subs:
@@ -371,7 +380,7 @@ class AssignmentPerformanceService:
         for submission, graded_date in zip(graded_subs, graded_dates):
             days_elapsed = (graded_date - term_start_date).days
             window_num = min(days_elapsed // window_size, 3)
-            windows[f"window_{window_num + 1}"].append(submission.score)
+            windows[f"window_{window_num + 1}"].append(round(submission.score / submission.max_score * 100, 1))
         
         # Calculate averages for each window
         window_avgs = {}
@@ -431,6 +440,17 @@ class AssignmentPerformanceService:
             if not student:
                 return {"error": "Student not found"}
             
+            course_module_assignment_ids = select(CourseModuleItem.assignment_id).join(
+                CourseModule, CourseModule.id == CourseModuleItem.module_id
+            ).where(
+                CourseModuleItem.school_id == student.school_id,
+                CourseModuleItem.assignment_id.is_not(None),
+                CourseModule.school_id == student.school_id,
+                CourseModule.class_id == student.class_id,
+                CourseModule.academic_term_id == academic_term_id,
+                CourseModule.is_published == True,
+            )
+
             # Get graded submissions
             submissions_result = await session.execute(
                 select(Submission)
@@ -438,7 +458,8 @@ class AssignmentPerformanceService:
                 .where(
                     (Submission.student_id == student_id) &
                     (Submission.status == SubmissionStatus.GRADED) &
-                    (Assignment.academic_term_id == academic_term_id)
+                    (Assignment.academic_term_id == academic_term_id) &
+                    Assignment.id.in_(course_module_assignment_ids)
                 )
             )
             submissions = submissions_result.scalars().all()
@@ -449,7 +470,8 @@ class AssignmentPerformanceService:
                 .where(
                     (Assignment.class_id == student.class_id) &
                     (Assignment.academic_term_id == academic_term_id) &
-                    (Assignment.status == "published")
+                    (Assignment.status == "published") &
+                    Assignment.id.in_(course_module_assignment_ids)
                 )
             )
             assignments = assignments_result.scalars().all()
@@ -479,12 +501,19 @@ class AssignmentPerformanceService:
             
             if term_start is None:
                 term_start = datetime.utcnow()
-            
+
+            # Resolve this student's grading scale once (school-configured
+            # scheme matching their class level, or the built-in GES fallback).
+            classroom = await session.get(Class, student.class_id) if student.class_id else None
+            schemes = await grading_service.get_school_schemes(session, student.school_id)
+            class_level = classroom.level if classroom else None
+            overall_scale = grading_service.match_scale(schemes, class_level)
+
             # Calculate all metrics
-            api = await self.calculate_api(submissions)
-            subject_perf = await self.calculate_subject_performance(grades, session)
+            api = await self.calculate_api(submissions, scale=overall_scale)
+            subject_perf = await self.calculate_subject_performance(grades, session, schemes=schemes, class_level=class_level)
             completion = await self.calculate_completion_metrics(submissions, assignments)
-            assessment_types = await self.calculate_assessment_type_breakdown(grades)
+            assessment_types = await self.calculate_assessment_type_breakdown(grades, scale=overall_scale)
             trend = await self.calculate_progress_trend(submissions, term_start)
             
             return {

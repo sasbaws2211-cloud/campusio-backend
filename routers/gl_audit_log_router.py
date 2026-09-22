@@ -19,11 +19,16 @@ from models.finance.gl_audit_log import (
 )
 from services.gl_audit_log_service import GLAuditLogService
 from dependencies import get_current_school_id
-from auth import get_current_user 
+from auth import get_current_user, require_roles
 from database import get_session
+from models.user import User, UserRole
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/gl-audit-logs", tags=["Audit Logs"])
+
+# The audit trail exposes IP addresses and every user's financial actions —
+# treat reading it as sensitively as the GL writes it records.
+FINANCE_ADMIN_ROLES = (UserRole.SUPER_ADMIN, UserRole.SCHOOL_ADMIN, UserRole.HR)
 
 
 # ==================== Retrieve by Entity ====================
@@ -33,6 +38,7 @@ async def get_entity_audit_logs(
     entity_type: str,
     entity_id: str,
     limit: int = Query(100, ge=1, le=1000),
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> list:
@@ -90,6 +96,7 @@ async def get_logs_by_action(
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     limit: int = Query(100, ge=1, le=1000),
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> list:
@@ -163,6 +170,7 @@ async def get_user_activity_logs(
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     limit: int = Query(100, ge=1, le=1000),
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> list:
@@ -227,6 +235,7 @@ async def get_logs_by_date_range(
     entity_type: Optional[str] = Query(None),
     action: Optional[str] = Query(None),
     limit: int = Query(500, ge=1, le=5000),
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> list:
@@ -307,6 +316,7 @@ async def get_logs_by_date_range(
 @router.get("/batch/{batch_id}", response_model=list)
 async def get_batch_logs(
     batch_id: str,
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> list:
@@ -344,6 +354,7 @@ async def get_batch_logs(
 async def get_audit_summary(
     start_date: str = Query(None),
     end_date: str = Query(None),
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -389,6 +400,7 @@ async def get_audit_summary(
 async def get_recent_activity(
     hours: int = Query(24, ge=1, le=720),
     limit: int = Query(50, ge=1, le=500),
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> list:
@@ -426,6 +438,7 @@ async def export_audit_trail(
     entity_type: str,
     entity_id: str,
     format: str = Query("list"),
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> dict:

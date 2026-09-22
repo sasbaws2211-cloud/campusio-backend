@@ -39,10 +39,54 @@ async def get_current_school_id(current_user: User = Depends(get_current_user)) 
     return str(current_user.school_id)
 
 
+def resolve_campus_scope(current_user: User, requested_campus_id: str | None = None) -> str | None:
+    """The campus_id a read query should be filtered by.
+
+    A campus-scoped user (User.campus_id set) always sees only their own
+    campus — their own assignment wins over whatever campus_id a query param
+    asks for, so a scoped admin can never widen their view by just passing a
+    different id. An unscoped user (campus_id is None, e.g. most
+    SCHOOL_ADMIN/SUPER_ADMIN accounts today) gets whatever was requested,
+    including None for "all campuses" — unchanged from current behavior.
+    """
+    if current_user.campus_id:
+        return current_user.campus_id
+    return requested_campus_id
+
+
+def resolve_write_campus_id(current_user: User, requested_campus_id: str | None = None) -> str | None:
+    """The campus_id to stamp on a newly created record.
+
+    Same precedence as resolve_campus_scope: a campus-scoped user's own
+    campus always wins, so they can't create a record in a campus other than
+    their own no matter what the request body says. An unscoped user's
+    submitted value (possibly None, i.e. school-wide) passes through.
+    """
+    if current_user.campus_id:
+        return current_user.campus_id
+    return requested_campus_id
+
+
+def assert_campus_access(current_user: User, record_campus_id: str | None) -> None:
+    """Raise 403 if a campus-scoped user is trying to read/write a record
+    outside their assigned campus. Records with no campus_id (school-wide,
+    or predating campus assignment) are also off-limits to a scoped user —
+    widening a record's scope is a school-level decision, not theirs to
+    make by editing it."""
+    if current_user.campus_id and record_campus_id != current_user.campus_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only access records in your assigned campus"
+        )
+
+
 # Re-export commonly used dependencies for convenience
 __all__ = [
     "get_db",
-    "get_session", 
+    "get_session",
     "get_current_user",
     "get_current_school_id",
+    "resolve_campus_scope",
+    "resolve_write_campus_id",
+    "assert_campus_access",
 ]

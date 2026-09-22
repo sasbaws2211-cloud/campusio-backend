@@ -13,15 +13,41 @@ from typing import List, Optional
 from datetime import datetime
 
 from models.grade import Grade, ReportCard, AssessmentType
-from models.staff import TeacherAssignment
+from models.staff import TeacherAssignment, Staff
 from models.student import Student
 from models.classroom import Class, Subject, ClassSubject
+from models.school import AcademicTerm
 from database import get_session
 from auth import get_current_user, require_roles
 from models.user import User, UserRole
 
 
 router = APIRouter(prefix="/teacher/grades", tags=["teacher-grades"])
+
+
+async def resolve_staff(current_user: User, session: AsyncSession) -> Staff:
+    """Resolve the logged-in teacher's Staff record (TeacherAssignment/Grade.recorded_by
+    are keyed on Staff.id, not User.id, so every lookup below needs this first)."""
+    staff_result = await session.execute(
+        select(Staff).where(Staff.user_id == current_user.id)
+    )
+    staff = staff_result.scalar()
+
+    if not staff and current_user.school_id:
+        staff_result = await session.execute(
+            select(Staff).where(
+                and_(
+                    Staff.email == current_user.email,
+                    Staff.school_id == current_user.school_id
+                )
+            )
+        )
+        staff = staff_result.scalar()
+
+    if not staff:
+        raise HTTPException(status_code=404, detail="Staff record not found for current user")
+
+    return staff
 
 
 @router.post("", response_model=dict)
@@ -48,8 +74,29 @@ async def record_grade(
     """
     try:
         school_id = current_user.school_id
-        teacher_id = current_user.id
-        
+        staff = await resolve_staff(current_user, session)
+        teacher_id = staff.id
+
+        academic_term_id = grade_data.get("academic_term_id")
+        if not academic_term_id:
+            raise HTTPException(status_code=400, detail="academic_term_id is required")
+
+        term_result = await session.execute(
+            select(AcademicTerm).where(AcademicTerm.id == academic_term_id, AcademicTerm.school_id == school_id)
+        )
+        term = term_result.scalar_one_or_none()
+        if not term:
+            raise HTTPException(status_code=400, detail="academic_term_id does not exist for this school")
+        if term.is_locked:
+            raise HTTPException(status_code=423, detail="This academic term is locked and no longer accepts new grades")
+
+        score = grade_data.get("score")
+        max_score = grade_data.get("max_score", 100)
+        if max_score is None or max_score <= 0:
+            raise HTTPException(status_code=400, detail="max_score must be greater than 0")
+        if score is None or score < 0 or score > max_score:
+            raise HTTPException(status_code=400, detail="score must be between 0 and max_score")
+
         # Verify teacher teaches this class
         assignment_result = await session.execute(
             select(TeacherAssignment).where(
@@ -62,13 +109,13 @@ async def record_grade(
             )
         )
         assignment = assignment_result.scalar()
-        
+
         if not assignment:
             raise HTTPException(
                 status_code=403,
                 detail="You are not assigned to teach this class/subject"
             )
-        
+
         # Verify student exists and is in the class
         student_result = await session.execute(
             select(Student).where(
@@ -80,10 +127,10 @@ async def record_grade(
             )
         )
         student = student_result.scalar()
-        
+
         if not student:
             raise HTTPException(status_code=404, detail="Student not found in this class")
-        
+
         # Create grade record
         grade = Grade(
             school_id=school_id,
@@ -91,13 +138,13 @@ async def record_grade(
             class_id=grade_data.get("class_id"),
             subject_id=grade_data.get("subject_id"),
             assessment_type=grade_data.get("assessment_type"),
-            score=grade_data.get("score"),
-            max_score=grade_data.get("max_score", 100),
+            score=score,
+            max_score=max_score,
             weight=grade_data.get("weight", 1.0),
             recorded_by=teacher_id,
-            academic_term_id=grade_data.get("academic_term_id"),
+            academic_term_id=academic_term_id,
         )
-        
+
         session.add(grade)
         await session.commit()
         await session.refresh(grade)
@@ -124,8 +171,9 @@ async def get_my_taught_classes(
     """Get list of classes the teacher is assigned to teach."""
     try:
         school_id = current_user.school_id
-        teacher_id = current_user.id
-        
+        staff = await resolve_staff(current_user, session)
+        teacher_id = staff.id
+
         # Get all assignments for this teacher
         result = await session.execute(
             select(TeacherAssignment).where(
@@ -183,8 +231,9 @@ async def get_class_grades(
     """
     try:
         school_id = current_user.school_id
-        teacher_id = current_user.id
-        
+        staff = await resolve_staff(current_user, session)
+        teacher_id = staff.id
+
         # Verify teacher teaches this class
         if subject_id:
             assignment_result = await session.execute(
@@ -279,7 +328,8 @@ async def get_student_grades(
     """Get all grades recorded for a specific student by this teacher."""
     try:
         school_id = current_user.school_id
-        
+        staff = await resolve_staff(current_user, session)
+
         # Verify student exists in this school
         student_result = await session.execute(
             select(Student).where(
@@ -290,16 +340,16 @@ async def get_student_grades(
             )
         )
         student = student_result.scalar()
-        
+
         if not student:
             raise HTTPException(status_code=404, detail="Student not found")
-        
+
         # Get grades recorded by this teacher for this student
         result = await session.execute(
             select(Grade).where(
                 and_(
                     Grade.student_id == student_id,
-                    Grade.recorded_by == current_user.id,
+                    Grade.recorded_by == staff.id,
                     Grade.school_id == school_id,
                 )
             ).order_by(Grade.created_at.desc())
@@ -342,25 +392,33 @@ async def update_grade(
     """Update a grade record (only by the teacher who recorded it)."""
     try:
         school_id = current_user.school_id
-        
+        staff = await resolve_staff(current_user, session)
+
         # Get the grade
         result = await session.execute(
             select(Grade).where(
                 and_(
                     Grade.id == grade_id,
                     Grade.school_id == school_id,
-                    Grade.recorded_by == current_user.id,
+                    Grade.recorded_by == staff.id,
                 )
             )
         )
         grade = result.scalar()
-        
+
         if not grade:
             raise HTTPException(
                 status_code=404,
                 detail="Grade not found or you don't have permission to edit it"
             )
-        
+
+        term_result = await session.execute(
+            select(AcademicTerm).where(AcademicTerm.id == grade.academic_term_id, AcademicTerm.school_id == school_id)
+        )
+        term = term_result.scalar_one_or_none()
+        if term and term.is_locked:
+            raise HTTPException(status_code=423, detail="This academic term is locked and no longer accepts changes")
+
         # Update fields
         if "score" in grade_data:
             grade.score = grade_data["score"]
@@ -370,7 +428,12 @@ async def update_grade(
             grade.weight = grade_data["weight"]
         if "assessment_type" in grade_data:
             grade.assessment_type = grade_data["assessment_type"]
-        
+
+        if grade.max_score is None or grade.max_score <= 0:
+            raise HTTPException(status_code=400, detail="max_score must be greater than 0")
+        if grade.score is None or grade.score < 0 or grade.score > grade.max_score:
+            raise HTTPException(status_code=400, detail="score must be between 0 and max_score")
+
         grade.updated_at = datetime.utcnow()
         
         await session.commit()

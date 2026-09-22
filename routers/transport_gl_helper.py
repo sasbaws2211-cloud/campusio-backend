@@ -146,7 +146,7 @@ async def _create_transport_journal_entry(
             posted_by="SYSTEM",
             approval_notes="Auto-posted from transport fee payment"
         )
-        
+
         return posted_entry.id
         
     except Exception as e:

@@ -11,13 +11,22 @@ from models.fee import Fee, FeePayment, FeeStructure, PaymentStatus
 from models.attendance import Attendance, AttendanceStatus
 from models.classroom import Class, Subject
 from models.communication import Announcement
-from models.assignment import Assignment, Submission, SubmissionStatus, AssignmentStatus
+from models.assignment import Assignment, Submission, SubmissionStatus, AssignmentStatus, CourseModule, CourseModuleItem
 from models.staff import Staff
 from models.hostel import StudentHostel, HostelFee, Room, Hostel
 from models.transport import StudentTransport, TransportFee, Route
+from models.library_circulation import LibraryLoan, LibraryFine, FineStatus
+from services.library_fine_service import is_fine_outstanding
+from models.ptm import PTMSlot, PTMBookingCreate, PTMCancelRequest
 from database import get_session
 from auth import get_current_user, require_roles
 from services.assignment_performance import AssignmentPerformanceService
+from services.ptm_service import PTMService, PTMServiceError
+from services.email_service import EmailService
+from services import grading_service
+from routers.library_circulation import _serialize_loan
+from utils.grade_scale import get_letter_grade
+from services.report_card_pdf_service import compute_subject_ges_totals, compute_overall_ges_score
 
 router = APIRouter(prefix="/parent", tags=["Parent Portal"])
 
@@ -59,27 +68,6 @@ async def verify_child_access(student_id: str, current_user: User, session: Asyn
         raise HTTPException(status_code=404, detail="Student not found")
 
     return student
-
-
-# GES Grading Scale
-GES_GRADE_SCALE = [
-    {"grade": "1", "min_score": 80, "max_score": 100, "description": "Excellent"},
-    {"grade": "2", "min_score": 70, "max_score": 79, "description": "Very Good"},
-    {"grade": "3", "min_score": 60, "max_score": 69, "description": "Good"},
-    {"grade": "4", "min_score": 55, "max_score": 59, "description": "Credit"},
-    {"grade": "5", "min_score": 50, "max_score": 54, "description": "Pass"},
-    {"grade": "6", "min_score": 45, "max_score": 49, "description": "Weak Pass"},
-    {"grade": "7", "min_score": 40, "max_score": 44, "description": "Very Weak"},
-    {"grade": "8", "min_score": 35, "max_score": 39, "description": "Poor"},
-    {"grade": "9", "min_score": 0, "max_score": 34, "description": "Fail"},
-]
-
-
-def get_letter_grade(percentage: float) -> dict:
-    for grade in GES_GRADE_SCALE:
-        if grade["min_score"] <= percentage <= grade["max_score"]:
-            return grade
-    return GES_GRADE_SCALE[-1]
 
 
 @router.get("/children", response_model=List[dict])
@@ -137,21 +125,25 @@ async def get_child_overview(
         cls = class_result.scalar_one_or_none()
         class_name = cls.name if cls else None
     
-    # Get recent attendance (last 30 days)
-    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    # Get recent attendance (last 30 days) — filtered by the actual attendance
+    # date, not when the record was created, so a backdated correction doesn't
+    # fall inside/outside this window based on when a teacher happened to fix it.
+    thirty_days_ago = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
     attendance_query = select(Attendance).where(
         Attendance.student_id == student_id,
-        Attendance.created_at >= thirty_days_ago
+        Attendance.attendance_date >= thirty_days_ago
     )
-    
+
     # Filter by term if provided
     if term_id:
         attendance_query = attendance_query.where(Attendance.academic_term_id == term_id)
-    
+
     attendance_result = await session.execute(attendance_query)
     attendance_records = attendance_result.scalars().all()
-    
-    present_count = sum(1 for a in attendance_records if a.status == AttendanceStatus.PRESENT)
+
+    # Late counts as attended, consistent with every other attendance-rate
+    # calculation in the app.
+    present_count = sum(1 for a in attendance_records if a.status in (AttendanceStatus.PRESENT, AttendanceStatus.LATE))
     absent_count = sum(1 for a in attendance_records if a.status == AttendanceStatus.ABSENT)
     late_count = sum(1 for a in attendance_records if a.status == AttendanceStatus.LATE)
     total_days = len(attendance_records)
@@ -168,7 +160,8 @@ async def get_child_overview(
     fees = fee_result.scalars().all()
     total_due = sum(f.amount_due for f in fees)
     total_paid = sum(f.amount_paid for f in fees)
-    fee_balance = total_due - total_paid
+    total_discount = sum(f.discount for f in fees)
+    fee_balance = max(0, total_due - total_paid - total_discount)
     
     # Get recent grades count
     grades_query = select(Grade).where(Grade.student_id == student_id)
@@ -216,7 +209,13 @@ async def get_child_grades(
 ):
     """Get child's grades, optionally filtered by academic term"""
     student = await verify_child_access(student_id, current_user, session)
-    
+
+    class_level = None
+    if student.class_id:
+        cls = await session.get(Class, student.class_id)
+        class_level = cls.level if cls else None
+    schemes = await grading_service.get_school_schemes(session, student.school_id)
+
     # Build query for grades
     query = select(Grade).where(Grade.student_id == student_id)
     
@@ -250,8 +249,8 @@ async def get_child_grades(
             }
         
         percentage = round(grade.score / grade.max_score * 100, 1)
-        letter = get_letter_grade(percentage)
-        
+        letter = get_letter_grade(percentage, scale=grading_service.match_scale(schemes, class_level, grade.subject_id))
+
         grades_by_subject[subject_name]["grades"].append({
             "assessment_type": grade.assessment_type,
             "score": grade.score,
@@ -264,11 +263,16 @@ async def get_child_grades(
         grades_by_subject[subject_name]["total_score"] += grade.score
         grades_by_subject[subject_name]["total_max"] += grade.max_score
     
-    # Calculate averages
+    # Calculate averages — school-configured CA:exam split (falls back to
+    # 50/50), weighted by Grade.weight, via compute_subject_ges_totals/
+    # compute_overall_ges_score: the same functions report cards use, so
+    # this agrees with what's printed there for the same term.
+    subject_weights = grading_service.build_subject_weights(schemes, class_level, subject_ids)
+    subject_ges_totals = compute_subject_ges_totals(grades, weights=subject_weights)
     subjects_list = []
     for name, data in grades_by_subject.items():
-        avg = round((data["total_score"] / data["total_max"] * 100) if data["total_max"] > 0 else 0, 1)
-        letter = get_letter_grade(avg)
+        avg = subject_ges_totals.get(data["subject_id"], {}).get("total_score", 0.0)
+        letter = get_letter_grade(avg, scale=grading_service.match_scale(schemes, class_level, data["subject_id"]))
         subjects_list.append({
             "subject_name": name,
             "grades_count": len(data["grades"]),
@@ -277,13 +281,11 @@ async def get_child_grades(
             "average_description": letter["description"],
             "grades": data["grades"]
         })
-    
+
     # Calculate overall average
-    total_score = sum(g.score for g in grades)
-    total_max = sum(g.max_score for g in grades)
-    overall_avg = round((total_score / total_max * 100) if total_max > 0 else 0, 1)
-    overall_grade = get_letter_grade(overall_avg)
-    
+    _, overall_avg = compute_overall_ges_score(grades, weights=subject_weights)
+    overall_grade = get_letter_grade(overall_avg, scale=grading_service.match_scale(schemes, class_level))
+
     return {
         "student_name": f"{student.first_name} {student.last_name}",
         "overall_average": overall_avg,
@@ -301,36 +303,26 @@ async def get_child_fees(
     session: AsyncSession = Depends(get_session)
 ):
     """Get child's fee details, optionally filtered by academic term"""
-    import sys
-    print("=" * 80, file=sys.stderr)
-    print(f"FEES ENDPOINT CALLED - student_id={student_id}, term_id={term_id}", file=sys.stderr)
-    print("=" * 80, file=sys.stderr)
-    
     student = await verify_child_access(student_id, current_user, session)
-    print(f"STUDENT FOUND: {student.first_name} {student.last_name}, class_id={student.class_id}", file=sys.stderr)
-    
+
     # First, try to get fees directly assigned to the student
     query = select(Fee).where(Fee.student_id == student_id)
-    
+
     # Filter by term if provided
     if term_id:
         query = query.where(Fee.academic_term_id == term_id)
-    
+
     fee_result = await session.execute(query)
     fees = fee_result.scalars().all()
-    print(f"DIRECT FEES: {len(fees)} found", file=sys.stderr)
-    
+
     # If no direct fees found, try to get fees by class (fees are usually assigned at class level)
     if not fees and student.class_id:
-        print(f"NO DIRECT FEES. Looking up class_id={student.class_id}", file=sys.stderr)
-        
         # Get the student's class to get its name/level
         class_result = await session.execute(
             select(Class).where(Class.id == student.class_id)
         )
         student_class = class_result.scalar_one_or_none()
-        print(f"CLASS LOOKUP: {student_class.name if student_class else 'CLASS NOT FOUND'}", file=sys.stderr)
-        
+
         if student_class:
             # Query FeeStructure by class_level (the ClassLevel enum like "jhs_1", not display name)
             # FeeStructure.class_level stores the enum value, not the display name
@@ -339,37 +331,23 @@ async def get_child_fees(
                 FeeStructure.class_level == class_level_value,
                 FeeStructure.school_id == student.school_id
             )
-            
+
             # Filter by term if provided
             if term_id:
                 struct_query = struct_query.where(FeeStructure.academic_term_id == term_id)
-                print(f"QUERY: class_level='{class_level_value}', school_id='{student.school_id}', term_id='{term_id}'", file=sys.stderr)
-            else:
-                print(f"QUERY: class_level='{class_level_value}', school_id='{student.school_id}', no term filter", file=sys.stderr)
-            
+
             struct_result = await session.execute(struct_query)
             fee_structures = struct_result.scalars().all()
-            print(f"FEESTRUCTURES WITH TERM: {len(fee_structures)} found", file=sys.stderr)
-            
-            # Debug: Check what FeeStructures actually exist in DB
-            all_structures_query = select(FeeStructure).where(FeeStructure.school_id == student.school_id)
-            all_structures_result = await session.execute(all_structures_query)
-            all_structures = all_structures_result.scalars().all()
-            print(f"DEBUG: Total FeeStructures in school: {len(all_structures)}", file=sys.stderr)
-            for fs in all_structures[:5]:  # Show first 5
-                print(f"  - class_level='{fs.class_level}', fee_type={fs.fee_type}, amount={fs.amount}", file=sys.stderr)
-            
+
             # If no fees found for that term, try without term filter (they may apply across terms)
             if not fee_structures and term_id:
-                print(f"NO TERM FEES. Trying without term filter...", file=sys.stderr)
                 struct_query = select(FeeStructure).where(
                     FeeStructure.class_level == class_level_value,
                     FeeStructure.school_id == student.school_id
                 )
                 struct_result = await session.execute(struct_query)
                 fee_structures = struct_result.scalars().all()
-                print(f"FEESTRUCTURES WITHOUT TERM: {len(fee_structures)} found", file=sys.stderr)
-            
+
             # Convert fee structures to fee records for the student
             # Create actual Fee records in the database (idempotent - won't duplicate)
             fees = []
@@ -384,11 +362,10 @@ async def get_child_fees(
                     )
                 )
                 existing_fee = existing_fee_result.scalar_one_or_none()
-                
+
                 if existing_fee:
                     # Use existing Fee record
                     fees.append(existing_fee)
-                    print(f"FEE EXISTS: {structure.fee_type} - GHS {structure.amount} for term {structure.academic_term_id}", file=sys.stderr)
                 else:
                     # Create new Fee record
                     new_fee = Fee(
@@ -403,14 +380,11 @@ async def get_child_fees(
                     )
                     session.add(new_fee)
                     fees.append(new_fee)
-                    print(f"FEE CREATED IN DB: {structure.fee_type} - GHS {structure.amount}", file=sys.stderr)
-            
+
             # Flush and commit to ensure fees are persisted to database
             await session.flush()
             await session.commit()
-    
-    print(f"TOTAL FEES READY: {len(fees)} fees", file=sys.stderr)
-    
+
     # Get fee structures
     structure_ids = list(set(f.fee_structure_id for f in fees))
     structures = {}
@@ -418,12 +392,16 @@ async def get_child_fees(
         struct_result = await session.execute(select(FeeStructure).where(FeeStructure.id.in_(structure_ids)))
         structures = {s.id: s for s in struct_result.scalars().all()}
     
-    # Get payments for all fees
+    # Get payments for all fees — excludes voided ones, same as every other
+    # consumer of FeePayment (e.g. services/analytics_reports_service.py's
+    # FeePayment.voided == False filter): a voided payment was reversed and
+    # must not still show up as a real receipt or count toward what the
+    # parent has paid.
     fee_ids = [f.id for f in fees]
     payments = []
     if fee_ids:
         payment_result = await session.execute(
-            select(FeePayment).where(FeePayment.fee_id.in_(fee_ids))
+            select(FeePayment).where(FeePayment.fee_id.in_(fee_ids), FeePayment.voided == False)  # noqa: E712
         )
         payments = payment_result.scalars().all()
     
@@ -437,8 +415,12 @@ async def get_child_fees(
         structure = structures.get(fee.fee_structure_id)
         fee_payments = [p for p in payments if p.fee_id == fee.id]
         
-        # Calculate actual amount paid from payments
-        actual_paid = sum(p.amount for p in fee_payments) if fee_payments else fee.amount_paid
+        # fee.amount_paid is the canonical, void-adjusted running total
+        # (routers/fees.py's record_payment/void_payment keep it in sync) —
+        # matches routers/student_portal.py's equivalent endpoint. Previously
+        # this re-summed FeePayment rows instead, which double-counted a
+        # voided payment's amount since that sum wasn't filtered by voided.
+        actual_paid = fee.amount_paid
         balance = fee.amount_due - actual_paid - fee.discount
         
         # Generate fee name from fee_type (e.g., "tuition" -> "Tuition Fee")
@@ -469,9 +451,6 @@ async def get_child_fees(
         total_paid += actual_paid
         total_discount += fee.discount
     
-    print(f"RESPONSE: {len(fees_list)} fees. Total due: GHS {total_due}, Total paid: GHS {total_paid}, Total discount: GHS {total_discount}", file=sys.stderr)
-    print("=" * 80, file=sys.stderr)
-    
     return {
         "student_name": f"{student.first_name} {student.last_name}",
         "summary": {
@@ -479,7 +458,12 @@ async def get_child_fees(
             "total_paid": total_paid,
             "total_discount": total_discount,
             "balance": max(0, total_due - total_paid - total_discount),
-            "collection_rate": round((total_paid / total_due * 100) if total_due > 0 else 100, 1)
+            # Divide by the net billable amount (due minus discount),
+            # matching "balance" above — previously used raw total_due.
+            "collection_rate": round(
+                (total_paid / (total_due - total_discount) * 100)
+                if (total_due - total_discount) > 0 else 100, 1
+            )
         },
         "fees": fees_list
     }
@@ -496,10 +480,12 @@ async def get_child_attendance(
     """Get child's attendance history, optionally filtered by academic term"""
     student = await verify_child_access(student_id, current_user, session)
     
-    # Build query for attendance
+    # Build query for attendance — filtered by the actual attendance date, not
+    # when the record was created (see get_child_overview for why).
+    cutoff_date = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
     query = select(Attendance).where(
         Attendance.student_id == student_id,
-        Attendance.created_at >= datetime.utcnow() - timedelta(days=days)
+        Attendance.attendance_date >= cutoff_date
     )
     
     # Filter by term if provided
@@ -589,11 +575,21 @@ async def get_child_assignments(
     if not student.class_id:
         return {"assignments": [], "message": "Child has no class assigned"}
     
-    # Build query for assignments
+    course_module_assignment_ids = select(CourseModuleItem.assignment_id).join(
+        CourseModule, CourseModule.id == CourseModuleItem.module_id
+    ).where(
+        CourseModuleItem.school_id == student.school_id,
+        CourseModuleItem.assignment_id.is_not(None),
+        CourseModule.school_id == student.school_id,
+        CourseModule.class_id == student.class_id,
+        CourseModule.is_published == True,
+    )
+
     query = select(Assignment).where(
         Assignment.school_id == current_user.school_id,
         Assignment.class_id == student.class_id,
-        Assignment.status == AssignmentStatus.PUBLISHED
+        Assignment.status == AssignmentStatus.PUBLISHED,
+        Assignment.id.in_(course_module_assignment_ids),
     )
     
     # Filter by term if provided
@@ -757,7 +753,7 @@ async def get_child_enrollment_status(
             StudentHostel.student_id == child_id,
             StudentHostel.school_id == student.school_id,
             StudentHostel.status == "active"
-        )
+        ).limit(1)
     )
     has_hostel = hostel_result.scalar_one_or_none() is not None
     
@@ -767,7 +763,7 @@ async def get_child_enrollment_status(
             StudentTransport.student_id == child_id,
             StudentTransport.school_id == student.school_id,
             StudentTransport.is_active == True
-        )
+        ).limit(1)
     )
     has_transport = transport_result.scalar_one_or_none() is not None
     
@@ -871,13 +867,16 @@ async def get_child_transport_status(
     student = await verify_child_access(child_id, current_user, session)
     
     transport_result = await session.execute(
-        select(StudentTransport).where(
+        select(StudentTransport)
+        .where(
             StudentTransport.student_id == child_id,
             StudentTransport.school_id == student.school_id,
             StudentTransport.is_active == True
         )
+        .order_by(StudentTransport.updated_at.desc(), StudentTransport.created_at.desc())
+        .limit(1)
     )
-    transport = transport_result.scalar_one_or_none()
+    transport = transport_result.scalars().first()
     
     if not transport:
         raise HTTPException(status_code=404, detail="Child is not enrolled in transport")
@@ -923,3 +922,187 @@ async def get_child_transport_status(
             for f in fees
         ]
     }
+
+
+@router.get("/child/{child_id}/library/loans", response_model=List[dict])
+async def get_child_library_loans(
+    child_id: str,
+    current_user: User = Depends(require_roles(UserRole.PARENT)),
+    session: AsyncSession = Depends(get_session)
+):
+    """Get a child's E-Library borrow history (active + past loans)"""
+    student = await verify_child_access(child_id, current_user, session)
+    if not student.user_id:
+        return []
+
+    result = await session.execute(
+        select(LibraryLoan)
+        .where(LibraryLoan.school_id == student.school_id, LibraryLoan.borrower_user_id == student.user_id)
+        .order_by(LibraryLoan.created_at.desc())
+    )
+    loans = result.scalars().all()
+    return [await _serialize_loan(session, loan) for loan in loans]
+
+
+@router.get("/child/{child_id}/library/fines", response_model=dict)
+async def get_child_library_fines(
+    child_id: str,
+    current_user: User = Depends(require_roles(UserRole.PARENT)),
+    session: AsyncSession = Depends(get_session)
+):
+    """Get a child's E-Library fines"""
+    student = await verify_child_access(child_id, current_user, session)
+    if not student.user_id:
+        return {"items": []}
+
+    result = await session.execute(
+        select(LibraryFine)
+        .join(LibraryLoan, LibraryLoan.id == LibraryFine.loan_id)
+        .where(LibraryFine.school_id == student.school_id, LibraryLoan.borrower_user_id == student.user_id)
+        .order_by(LibraryFine.created_at.desc())
+    )
+    fines = result.scalars().all()
+
+    items = []
+    for fine in fines:
+        loan_result = await session.execute(select(LibraryLoan).where(LibraryLoan.id == fine.loan_id))
+        loan = loan_result.scalar_one_or_none()
+        serialized_loan = await _serialize_loan(session, loan) if loan else None
+        # A fine's own status can lag reality if its Fee was paid off
+        # through the general fee ledger rather than the library module's
+        # own pay_fine — show the parent what's actually true, not a
+        # possibly-stale "pending" for something they already paid.
+        display_status = fine.status
+        if fine.status == FineStatus.PENDING.value and not await is_fine_outstanding(session, fine):
+            display_status = FineStatus.PAID.value
+        items.append({
+            "id": fine.id,
+            "loan_id": fine.loan_id,
+            "amount": fine.amount,
+            "reason": fine.reason,
+            "status": display_status,
+            "created_at": fine.created_at,
+            "item_title": serialized_loan["item_title"] if serialized_loan else None,
+        })
+
+    return {"items": items}
+
+
+# ── Parent-teacher meeting scheduling ───────────────────────────────────────
+
+async def _resolve_own_parent(session: AsyncSession, current_user: User) -> Parent:
+    result = await session.execute(select(Parent).where(Parent.user_id == current_user.id))
+    parent = result.scalar_one_or_none()
+    if not parent:
+        raise HTTPException(status_code=404, detail="No parent profile linked to this account")
+    return parent
+
+
+@router.get("/ptm/slots", response_model=dict)
+async def list_ptm_slots(
+    teacher_id: Optional[str] = None,
+    from_date: Optional[str] = None,
+    current_user: User = Depends(require_roles(UserRole.PARENT)),
+    session: AsyncSession = Depends(get_session),
+):
+    service = PTMService(session)
+    slots = await service.list_open_slots(current_user.school_id, teacher_id, from_date)
+    slots_out = []
+    for slot in slots:
+        teacher_result = await session.execute(select(Staff).where(Staff.id == slot.teacher_id))
+        teacher = teacher_result.scalar_one_or_none()
+        slots_out.append({
+            "id": slot.id,
+            "teacher_id": slot.teacher_id,
+            "teacher_name": f"{teacher.first_name} {teacher.last_name}" if teacher else "Unknown",
+            "date": slot.date,
+            "start_time": slot.start_time,
+            "end_time": slot.end_time,
+            "location": slot.location,
+        })
+    return {"slots": slots_out}
+
+
+@router.post("/ptm/bookings", response_model=dict)
+async def book_ptm_slot(
+    body: PTMBookingCreate,
+    current_user: User = Depends(require_roles(UserRole.PARENT)),
+    session: AsyncSession = Depends(get_session),
+):
+    parent = await _resolve_own_parent(session, current_user)
+    service = PTMService(session)
+    try:
+        booking = await service.book_slot(current_user.school_id, parent.id, body.slot_id, body.student_id, body.purpose)
+    except PTMServiceError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    teacher_result = await session.execute(select(Staff).where(Staff.id == booking.teacher_id))
+    teacher = teacher_result.scalar_one_or_none()
+    student_result = await session.execute(select(Student).where(Student.id == booking.student_id))
+    student = student_result.scalar_one_or_none()
+    slot_result = await session.execute(select(PTMSlot).where(PTMSlot.id == booking.slot_id))
+    slot = slot_result.scalar_one_or_none()
+
+    if parent.email and teacher and slot:
+        await EmailService().send_email(
+            to=[parent.email],
+            subject="Parent-teacher meeting confirmed",
+            html_body=(
+                f"<p>Your meeting with {teacher.first_name} {teacher.last_name} "
+                f"regarding {student.first_name if student else 'your child'} is confirmed for "
+                f"{slot.date} {slot.start_time}-{slot.end_time}"
+                f"{' at ' + slot.location if slot.location else ''}.</p>"
+            ),
+        )
+    if teacher and teacher.email and slot:
+        await EmailService().send_email(
+            to=[teacher.email],
+            subject="New parent-teacher meeting booked",
+            html_body=(
+                f"<p>{parent.first_name} {parent.last_name} booked your "
+                f"{slot.date} {slot.start_time}-{slot.end_time} slot"
+                f"{' regarding ' + student.first_name if student else ''}.</p>"
+            ),
+        )
+
+    return {"success": True, "booking_id": booking.id, "message": "Meeting booked"}
+
+
+@router.get("/ptm/bookings", response_model=dict)
+async def list_my_ptm_bookings(
+    current_user: User = Depends(require_roles(UserRole.PARENT)),
+    session: AsyncSession = Depends(get_session),
+):
+    parent = await _resolve_own_parent(session, current_user)
+    service = PTMService(session)
+    bookings = await service.list_parent_bookings(current_user.school_id, parent.id)
+    return {"bookings": bookings}
+
+
+@router.post("/ptm/bookings/{booking_id}/cancel", response_model=dict)
+async def cancel_ptm_booking(
+    booking_id: str,
+    body: PTMCancelRequest,
+    current_user: User = Depends(require_roles(UserRole.PARENT)),
+    session: AsyncSession = Depends(get_session),
+):
+    parent = await _resolve_own_parent(session, current_user)
+    service = PTMService(session)
+    try:
+        booking = await service.cancel_booking(
+            current_user.school_id, booking_id, cancelled_by="parent", reason=body.reason, parent_id=parent.id,
+        )
+    except PTMServiceError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    teacher_result = await session.execute(select(Staff).where(Staff.id == booking.teacher_id))
+    teacher = teacher_result.scalar_one_or_none()
+    if teacher and teacher.email:
+        await EmailService().send_email(
+            to=[teacher.email],
+            subject="Parent-teacher meeting cancelled",
+            html_body=f"<p>{parent.first_name} {parent.last_name} cancelled their booking with you.</p>"
+                      + (f"<p>Reason: {body.reason}</p>" if body.reason else ""),
+        )
+
+    return {"success": True, "message": "Booking cancelled"}

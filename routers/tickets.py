@@ -169,7 +169,7 @@ async def list_tickets(
 @router.get("/{ticket_id}", response_model=dict)
 async def get_ticket_detail(
     ticket_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_roles(UserRole.SCHOOL_ADMIN, UserRole.SUPER_ADMIN)),
     session: AsyncSession = Depends(get_session)
 ):
     """Get ticket details with comments"""
@@ -309,7 +309,7 @@ async def update_ticket_status(
 async def add_ticket_comment(
     ticket_id: str,
     comment_data: TicketCommentCreate,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_roles(UserRole.SCHOOL_ADMIN, UserRole.SUPER_ADMIN)),
     session: AsyncSession = Depends(get_session)
 ):
     """Add comment to ticket"""

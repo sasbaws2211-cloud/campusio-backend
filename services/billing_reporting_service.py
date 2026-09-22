@@ -36,7 +36,15 @@ class BillingReportingService:
             query = select(PlatformSubscription)
             if school_id:
                 query = query.where(PlatformSubscription.school_id == school_id)
-            
+            if academic_year:
+                # academic_year isn't a column on PlatformSubscription itself —
+                # it lives on the invoice generated alongside it. This used to
+                # be accepted and echoed back in the response without ever
+                # being applied, so the filter was a silent no-op.
+                query = query.join(
+                    SubscriptionInvoice, SubscriptionInvoice.id == PlatformSubscription.invoice_id
+                ).where(SubscriptionInvoice.academic_year == academic_year)
+
             result = await session.execute(query)
             subscriptions = result.scalars().all()
             

@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>Payslip - {{ staff_name }}</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: "Times New Roman", Georgia, serif;
+            color: #111;
+            background: #fff;
+            font-size: 13px;
+            line-height: 1.45;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 28px 34px;
+            border: 2px solid #111;
+        }
+
+        /* Header */
+        .header { text-align: center; border-bottom: 2px solid #111; padding-bottom: 12px; margin-bottom: 14px; }
+        .school-name { font-size: 22px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.5px; }
+        .report-title { font-size: 15px; font-weight: bold; text-transform: uppercase; margin-top: 6px; letter-spacing: 2px; }
+        .term-line { font-size: 13px; margin-top: 3px; }
+
+        /* Employee info grid */
+        .info-table { width: 100%; border-collapse: collapse; margin-bottom: 14px; }
+        .info-table td { padding: 4px 6px; font-size: 13px; }
+        .info-label { font-weight: bold; white-space: nowrap; }
+        .info-value { border-bottom: 1px dotted #555; min-width: 120px; }
+
+        /* Earnings / Deductions tables */
+        .amounts-table { width: 100%; border-collapse: collapse; margin-bottom: 16px; }
+        .amounts-table th, .amounts-table td { border: 1px solid #111; padding: 6px 8px; }
+        .amounts-table th {
+            background: #efefef;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.4px;
+            text-align: left;
+        }
+        .amounts-table td { font-size: 13px; }
+        .amounts-table td.num { text-align: right; }
+        .amounts-table .total-row td { font-weight: bold; background: #f6f6f6; }
+
+        .section-title { font-size: 13px; font-weight: bold; text-transform: uppercase; margin: 14px 0 6px; letter-spacing: 0.5px; }
+
+        .net-pay-row { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        .net-pay-row td { border: 2px solid #111; padding: 10px 8px; font-size: 15px; font-weight: bold; }
+        .net-pay-row td.num { text-align: right; }
+
+        .footer-note { text-align: center; font-size: 10px; color: #666; margin-top: 20px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <div class="school-name">{{ school_name }}</div>
+            <div class="report-title">Payslip</div>
+            <div class="term-line">{{ period_name }}</div>
+        </div>
+
+        <!-- Employee information -->
+        <table class="info-table">
+            <tr>
+                <td class="info-label">Employee Name:</td>
+                <td class="info-value">{{ staff_name }}</td>
+                <td class="info-label">Staff ID:</td>
+                <td class="info-value">{{ staff_id_code }}</td>
+            </tr>
+            <tr>
+                <td class="info-label">Position:</td>
+                <td class="info-value">{{ position }}</td>
+                <td class="info-label">Pay Period:</td>
+                <td class="info-value">{{ period_name }}</td>
+            </tr>
+            <tr>
+                <td class="info-label">Payment Status:</td>
+                <td class="info-value">{{ payment_status }}</td>
+                <td class="info-label">Currency:</td>
+                <td class="info-value">{{ currency }}</td>
+            </tr>
+        </table>
+
+        {% if proration_note %}
+        <div class="footer-note" style="text-align: left; font-weight: bold; margin-top: 0; margin-bottom: 10px;">{{ proration_note }} (new hire or exit mid-period)</div>
+        {% endif %}
+
+        <!-- Earnings -->
+        <div class="section-title">Earnings</div>
+        <table class="amounts-table">
+            <thead>
+                <tr>
+                    <th style="width: 70%;">Description</th>
+                    <th style="width: 30%;">Amount</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Basic Salary</td>
+                    <td class="num">{{ basic_salary }}</td>
+                </tr>
+                {% if allowance_items %}
+                {% for item in allowance_items %}
+                <tr>
+                    <td>&nbsp;&nbsp;{{ item.label }}</td>
+                    <td class="num">{{ item.amount }}</td>
+                </tr>
+                {% endfor %}
+                {% else %}
+                <tr>
+                    <td>Allowances</td>
+                    <td class="num">{{ total_allowances }}</td>
+                </tr>
+                {% endif %}
+                <tr class="total-row">
+                    <td>Gross Pay</td>
+                    <td class="num">{{ gross_amount }}</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <!-- Deductions -->
+        <div class="section-title">Deductions</div>
+        <table class="amounts-table">
+            <thead>
+                <tr>
+                    <th style="width: 70%;">Description</th>
+                    <th style="width: 30%;">Amount</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Income Tax</td>
+                    <td class="num">{{ tax_amount }}</td>
+                </tr>
+                <tr>
+                    <td>Pension</td>
+                    <td class="num">{{ pension_amount }}</td>
+                </tr>
+                <tr>
+                    <td>NSSF</td>
+                    <td class="num">{{ nssf_amount }}</td>
+                </tr>
+                {% if applied_rule_items %}
+                {% for item in applied_rule_items %}
+                <tr>
+                    <td>&nbsp;&nbsp;{{ item.label }}</td>
+                    <td class="num">{{ item.amount }}</td>
+                </tr>
+                {% endfor %}
+                {% endif %}
+                {% if unpaid_leave_deduction_numeric != 0 %}
+                <tr>
+                    <td>&nbsp;&nbsp;Unpaid Leave ({{ unpaid_leave_days }} day{{ 's' if unpaid_leave_days != 1 else '' }})</td>
+                    <td class="num">{{ unpaid_leave_deduction }}</td>
+                </tr>
+                {% endif %}
+                <tr>
+                    <td>Other Deductions</td>
+                    <td class="num">{{ other_deductions }}</td>
+                </tr>
+                {% if adjustment_items %}
+                {% for item in adjustment_items %}
+                <tr>
+                    <td>&nbsp;&nbsp;{{ item.label }}</td>
+                    <td class="num">{{ item.amount }}</td>
+                </tr>
+                {% endfor %}
+                {% elif adjustments_total_numeric != 0 %}
+                <tr>
+                    <td>Adjustments (bonuses, loan repayments, leave encashment, etc.)</td>
+                    <td class="num">{{ adjustments_total }}</td>
+                </tr>
+                {% endif %}
+                <tr class="total-row">
+                    <td>Total Deductions</td>
+                    <td class="num">{{ total_deductions }}</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <!-- Net Pay -->
+        <table class="net-pay-row">
+            <tr>
+                <td>Net Pay</td>
+                <td class="num">{{ currency }} {{ net_amount }}</td>
+            </tr>
+        </table>
+
+        <div class="footer-note">Generated by Campusio on {{ generated_date }}</div>
+    </div>
+</body>
+</html>

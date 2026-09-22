@@ -35,6 +35,17 @@ class Withdrawal(SQLModel, table=True):
     # Status tracking
     status: WithdrawalStatus = WithdrawalStatus.PENDING
     failure_reason: Optional[str] = None
+
+    # Paystack's transfer fee for this withdrawal, when known from the
+    # gateway's own response — None means unknown, not zero (a completed
+    # withdrawal is still posted to the GL without a fee line rather than
+    # fabricating a number this codebase doesn't actually have).
+    transfer_fee: Optional[float] = None
+    # The GL entry posted when this withdrawal completes (Dr Business
+    # Checking / Cr Paystack Clearing) — see
+    # services/fee_gl_service.py::post_settlement_withdrawal. Previously a
+    # completed withdrawal never touched the GL at all.
+    journal_entry_id: Optional[str] = None
     
     # Timeline
     initiated_at: datetime = Field(default_factory=datetime.utcnow)

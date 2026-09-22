@@ -30,25 +30,28 @@ class EmailService:
         subject: str,
         html_body: str,
         text_body: Optional[str] = None,
-        reply_to: Optional[str] = None
+        reply_to: Optional[str] = None,
+        attachments: Optional[List[Dict]] = None
     ) -> Dict:
         """
         Send a transactional email
-        
+
         Args:
             to: List of recipient email addresses
             subject: Email subject line
             html_body: HTML content of the email
             text_body: Plain text alternative (optional)
             reply_to: Reply-to email address (optional)
-        
+            attachments: Optional list of {"filename": str, "content": str} — content
+                is base64-encoded file bytes, passed through to Resend as-is.
+
         Returns:
             Response from Resend API
         """
         if not self.api_key:
             logger.warning("Resend API key not configured - email not sent")
             return {"success": False, "error": "Email service not configured"}
-        
+
         try:
             payload = {
                 "from": f"{self.from_name} <{self.from_email}>",
@@ -56,12 +59,15 @@ class EmailService:
                 "subject": subject,
                 "html": html_body,
             }
-            
+
             if text_body:
                 payload["text"] = text_body
-            
+
             if reply_to:
                 payload["reply_to"] = reply_to
+
+            if attachments:
+                payload["attachments"] = attachments
             
             async with httpx.AsyncClient() as client:
                 response = await client.post(
@@ -480,6 +486,76 @@ This is an automated message. Please do not reply.
             to=[to],
             subject=f"Fee Reminder: {student_name} - GHS {amount_due:,.2f} Due",
             html_body=html_body
+        )
+
+    async def send_admission_confirmation(
+        self,
+        to: str,
+        applicant_name: str,
+        school_name: str,
+        fee_paid: bool = False,
+        amount: Optional[float] = None,
+    ) -> Dict:
+        """Confirms receipt of a public admissions application to the
+        guardian's email. `fee_paid`/`amount` are set when this confirms a
+        completed application-fee payment rather than a free submission."""
+
+        if fee_paid:
+            status_line = f"Your application fee of GHS {amount:,.2f} has been received and your application is now complete." if amount else "Your application fee has been received and your application is now complete."
+        else:
+            status_line = "Your application has been received and is now with the school's admissions team."
+
+        html_body = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                body {{ font-family: 'IBM Plex Sans', Arial, sans-serif; color: #1A1A1A; line-height: 1.6; margin: 0; padding: 0; }}
+                .container {{ max-width: 600px; margin: 0 auto; padding: 20px; background-color: #FAFAED; }}
+                .header {{ background-color: #064E3B; color: white; padding: 24px; text-align: center; border-radius: 12px 12px 0 0; }}
+                .content {{ background-color: white; padding: 24px; border: 1px solid #E4E4E7; border-top: none; border-radius: 0 0 12px 12px; }}
+                .status {{ background: #ECFDF5; border-left: 3px solid #064E3B; padding: 12px 16px; border-radius: 0 6px 6px 0; margin: 20px 0; color: #065F46; }}
+                .footer {{ text-align: center; font-size: 12px; color: #A1A1AA; margin-top: 24px; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>{school_name}</h1>
+                </div>
+                <div class="content">
+                    <p>Dear Parent/Guardian,</p>
+                    <p>Thank you for applying to <strong>{school_name}</strong> on behalf of <strong>{applicant_name}</strong>.</p>
+                    <div class="status">{status_line}</div>
+                    <p>The school will be in touch regarding next steps. If you have any questions, please contact the school directly.</p>
+                </div>
+                <div class="footer">
+                    <p>{school_name}</p>
+                    <p>This is an automated message.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        text_body = f"""
+{school_name} — Application Received
+
+Dear Parent/Guardian,
+
+Thank you for applying to {school_name} on behalf of {applicant_name}.
+
+{status_line}
+
+The school will be in touch regarding next steps.
+        """
+
+        return await self.send_email(
+            to=[to],
+            subject=f"Application Received — {applicant_name} ({school_name})",
+            html_body=html_body,
+            text_body=text_body,
         )
 
 

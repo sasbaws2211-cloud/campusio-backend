@@ -24,8 +24,13 @@ from models.finance.subledger_reconciliation import (
     SubLedgerType,
 )
 from dependencies import get_current_school_id
-from auth import get_current_user 
+from auth import get_current_user, require_roles
 from database import get_session
+from models.user import User, UserRole
+
+# Creating/matching/approving sub-ledger reconciliations mutates GL-adjacent
+# records — same role gate as journal.py's posting endpoints.
+FINANCE_ADMIN_ROLES = (UserRole.SUPER_ADMIN, UserRole.SCHOOL_ADMIN, UserRole.HR)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/subledger-reconciliation", tags=["Sub-Ledger Reconciliation"])
@@ -44,7 +49,7 @@ class CreateSubledgerReconciliationRequest(SQLModel):
 @router.post("/create", response_model=dict)
 async def create_subledger_reconciliation(
     body: CreateSubledgerReconciliationRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -80,15 +85,15 @@ async def create_subledger_reconciliation(
             subledger_type=subledger_type,
             control_account_id=control_account_id,
             detail_records=detail_records or [],
-            reconciled_by=current_user.get("id", "unknown"),
+            reconciled_by=current_user.id,
             notes=notes,
         )
-        
+
         # Calculate totals
         detail_total = sum(r.detail_balance for r in (detail_records or []))
-        
+
         logger.info(
-            f"Sub-ledger reconciliation created by {current_user.get('id')} "
+            f"Sub-ledger reconciliation created by {current_user.id} "
             f"({subledger_type.value}) with {len(detail_records or [])} detail records"
         )
         
@@ -108,11 +113,70 @@ async def create_subledger_reconciliation(
         raise HTTPException(status_code=500, detail="Failed to create reconciliation")
 
 
+class AutoGenerateSubledgerReconciliationRequest(SQLModel):
+    subledger_type: SubLedgerType
+    control_account_id: str
+    notes: Optional[str] = None
+
+
+@router.post("/auto-generate", response_model=dict)
+async def auto_generate_subledger_reconciliation(
+    body: AutoGenerateSubledgerReconciliationRequest,
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
+    school_id: str = Depends(get_current_school_id),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Create a sub-ledger reconciliation with detail records auto-derived
+    from the actual Fee (for ACCOUNTS_RECEIVABLE) or Expense (for
+    ACCOUNTS_PAYABLE) tables, instead of requiring every student/vendor
+    balance to be hand-keyed via /create's detail_records list — that
+    manual path still exists for HOSTEL_DEPOSITS/EMPLOYEE_ADVANCES/OTHER,
+    which have no single source table this can assume.
+    """
+    try:
+        service = SubLedgerReconciliationService(session)
+        detail_records = await service.build_detail_records_from_subledger(
+            school_id=school_id, subledger_type=body.subledger_type,
+        )
+
+        recon_id = await service.create_subledger_reconciliation(
+            school_id=school_id,
+            subledger_type=body.subledger_type,
+            control_account_id=body.control_account_id,
+            detail_records=detail_records,
+            reconciled_by=current_user.id,
+            notes=body.notes,
+        )
+
+        detail_total = sum(r.detail_balance for r in detail_records)
+
+        logger.info(
+            f"Auto-generated sub-ledger reconciliation by {current_user.id} "
+            f"({body.subledger_type.value}) with {len(detail_records)} detail records"
+        )
+
+        return {
+            "status": "success",
+            "reconciliation_id": recon_id,
+            "subledger_type": body.subledger_type.value,
+            "detail_records_imported": len(detail_records),
+            "detail_total": detail_total,
+            "next_step": "Run auto-matching",
+        }
+    except SubLedgerReconciliationError as e:
+        logger.warning(f"Error auto-generating reconciliation: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error in auto-generate reconciliation: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to auto-generate reconciliation")
+
+
 # ==================== Automatic Matching ====================
 
 @router.post("/auto-match/{reconciliation_id}", response_model=dict)
 async def auto_match_details(
     reconciliation_id: str,
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -318,7 +382,7 @@ async def get_reconciliation_summary(
 @router.post("/complete/{reconciliation_id}", response_model=dict)
 async def complete_reconciliation(
     reconciliation_id: str,
-    current_user: dict = Depends(get_current_user),
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -343,12 +407,12 @@ async def complete_reconciliation(
         result = await service.complete_reconciliation(
             school_id=school_id,
             reconciliation_id=reconciliation_id,
-            approved_by=current_user.get("id", "unknown"),
+            approved_by=current_user.id,
         )
-        
+
         logger.info(
             f"Sub-ledger reconciliation {reconciliation_id} completed and approved by "
-            f"{current_user.get('id')}"
+            f"{current_user.id}"
         )
         
         return {

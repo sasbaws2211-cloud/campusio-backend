@@ -94,6 +94,12 @@
                 <td class="info-label">Overall Average:</td>
                 <td class="info-value">{{ overall_average }} (Grade {{ overall_grade }} - {{ overall_description }})</td>
             </tr>
+            <tr>
+                <td class="info-label">Class Average:</td>
+                <td class="info-value">{{ class_average }}</td>
+                <td class="info-label"></td>
+                <td class="info-value"></td>
+            </tr>
         </table>
 
         <!-- Subjects: GES SBA class score / exam score split -->
@@ -132,6 +138,31 @@
         </table>
         {% else %}
         <div class="empty-state">No grades recorded for this student in this term.</div>
+        {% endif %}
+
+        <!-- Standards mastery: optional, parallel to the percentage-based
+             subjects table above — only rendered when mastery records exist. -->
+        {% if mastery_records %}
+        <table class="subjects-table">
+            <thead>
+                <tr>
+                    <th style="width: 20%;">Standard</th>
+                    <th style="width: 50%;">Description</th>
+                    <th style="width: 15%;">Mastery Level</th>
+                    <th style="width: 15%;">Notes</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for record in mastery_records %}
+                <tr>
+                    <td class="subject-cell">{{ record.standard_code or '-' }}</td>
+                    <td>{{ record.standard_title or '' }}</td>
+                    <td class="num">{{ record.mastery_level }}</td>
+                    <td>{{ record.notes or '' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
         {% endif %}
 
         <!-- Attitude / Conduct / Interest -->

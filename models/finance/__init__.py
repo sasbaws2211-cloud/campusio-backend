@@ -9,9 +9,9 @@ from .gl_audit_log import (
     AuditActionType, AuditEntityType,
 )
 from .account_hierarchy import (
-    AccountHierarchy, HierarchyNode, HierarchyRelationship,
+    AccountHierarchy, HierarchyNode,
     HierarchyRollup, HierarchyConsolidation,
-    HierarchyNodeCreate, HierarchyNodeResponse, HierarchyRelationshipCreate,
+    HierarchyNodeCreate, HierarchyNodeResponse,
     AccountHierarchyType, HierarchyLevel,
 )
 from .bank_reconciliation import (
@@ -62,6 +62,9 @@ from .expenses import (
     ExpensePaymentRequest,
     ExpenseSummary,
     ExpenseByCategory,
+    Vendor,
+    VendorCreate,
+    VendorUpdate,
 )
 from .reports import (
     TrialBalanceReport,
@@ -77,6 +80,48 @@ from .reports import (
     ReportPeriodType,
     ReportDateRangeRequest,
     ReportAsOfDateRequest,
+)
+from .exchange_rate import (
+    ExchangeRate,
+    ExchangeRateCreate,
+    ExchangeRateResponse,
+)
+from .budget import (
+    Budget,
+    BudgetCreate,
+    BudgetUpdate,
+    BudgetResponse,
+    BudgetVsActualLine,
+    BudgetApprovalRequest,
+    BudgetRejectionRequest,
+    BudgetPlan,
+    BudgetPlanCreate,
+    BudgetPlanUpdate,
+    BudgetPlanResponse,
+)
+from .recurring_entry import (
+    RecurringJournalEntryTemplate,
+    RecurringEntryLineTemplate,
+    RecurringJournalEntryTemplateCreate,
+    RecurringEntryLineTemplateCreate,
+    RecurringJournalEntryTemplateResponse,
+    RecurringEntryLineTemplateResponse,
+    RecurrenceFrequency,
+)
+from .depreciation import (
+    DepreciationSchedule,
+    DepreciationScheduleCreate,
+    DepreciationScheduleResponse,
+    DepreciationMethod,
+    DisposeAssetRequest,
+    DisposeAssetResponse,
+)
+from .accounting_integration import (
+    ExternalAccountMapping,
+    ExternalAccountMappingUpsert,
+    JournalEntrySyncLog,
+    OpeningBalanceImport,
+    AccountingProvider,
 )
 
 __all__ = [
@@ -115,6 +160,9 @@ __all__ = [
     "ExpensePaymentRequest",
     "ExpenseSummary",
     "ExpenseByCategory",
+    "Vendor",
+    "VendorCreate",
+    "VendorUpdate",
     # Reports
     "TrialBalanceReport",
     "TrialBalanceLineItem",
@@ -129,4 +177,41 @@ __all__ = [
     "ReportPeriodType",
     "ReportDateRangeRequest",
     "ReportAsOfDateRequest",
+    # Exchange Rates
+    "ExchangeRate",
+    "ExchangeRateCreate",
+    "ExchangeRateResponse",
+    # Budgets
+    "Budget",
+    "BudgetCreate",
+    "BudgetUpdate",
+    "BudgetResponse",
+    "BudgetVsActualLine",
+    "BudgetApprovalRequest",
+    "BudgetRejectionRequest",
+    "BudgetPlan",
+    "BudgetPlanCreate",
+    "BudgetPlanUpdate",
+    "BudgetPlanResponse",
+    # Recurring Entries
+    "RecurringJournalEntryTemplate",
+    "RecurringEntryLineTemplate",
+    "RecurringJournalEntryTemplateCreate",
+    "RecurringEntryLineTemplateCreate",
+    "RecurringJournalEntryTemplateResponse",
+    "RecurringEntryLineTemplateResponse",
+    "RecurrenceFrequency",
+    # Depreciation
+    "DepreciationSchedule",
+    "DepreciationScheduleCreate",
+    "DepreciationScheduleResponse",
+    "DepreciationMethod",
+    "DisposeAssetRequest",
+    "DisposeAssetResponse",
+    # Accounting Integrations (Tally / QuickBooks Desktop export)
+    "ExternalAccountMapping",
+    "ExternalAccountMappingUpsert",
+    "JournalEntrySyncLog",
+    "OpeningBalanceImport",
+    "AccountingProvider",
 ]

@@ -24,12 +24,48 @@ from models.finance.bank_reconciliation import (
     BankReconciliationCreate,
     BankTransactionType,
 )
+from models.finance.gl_audit_log import AuditActionType, AuditEntityType
 from dependencies import get_current_school_id
-from auth import get_current_user 
+from auth import get_current_user, require_permission
 from database import get_session
+from models.user import User
+from services.gl_audit_log_service import GLAuditLogService
+from services.plan_gating import require_plan_feature
+
+# Importing statements, matching, and approving reconciliations all mutate
+# GL-adjacent records — same role gate as journal.py's posting endpoints.
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/bank-reconciliation", tags=["Bank Reconciliation"])
+router = APIRouter(
+    prefix="/bank-reconciliation", tags=["Bank Reconciliation"],
+    dependencies=[Depends(require_plan_feature("finance_advanced"))],
+)
+
+
+async def _log_gl_audit(
+    session: AsyncSession,
+    school_id: str,
+    entity_id: str,
+    action: AuditActionType,
+    current_user: User,
+    old_values: Optional[dict] = None,
+    new_values: Optional[dict] = None,
+) -> None:
+    """Best-effort GL audit log write — never blocks the actual mutation if it fails."""
+    try:
+        await GLAuditLogService(session).log_action(
+            school_id=school_id,
+            entity_type=AuditEntityType.BANK_RECONCILIATION,
+            entity_id=entity_id,
+            action=action,
+            user_id=current_user.id,
+            user_name=f"{current_user.first_name} {current_user.last_name}",
+            user_role=current_user.role.value,
+            old_values=old_values,
+            new_values=new_values,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to write GL audit log for bank reconciliation {entity_id}: {e}")
 
 
 # ── Request bodies (mutating endpoints must never take bare query params) ──
@@ -56,7 +92,7 @@ class ManualMatchRequest(SQLModel):
 @router.post("/import", response_model=dict)
 async def import_bank_statement(
     body: ImportBankStatementRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: User = Depends(require_permission("finance.bank_reconciliation.manage")),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -97,12 +133,12 @@ async def import_bank_statement(
             statement_beginning_balance=statement_beginning_balance,
             statement_ending_balance=statement_ending_balance,
             transactions=transactions or [],
-            reconciled_by=current_user.get("id", "unknown"),
-            notes=f"Imported by {current_user.get('username', 'unknown')}",
+            reconciled_by=current_user.id,
+            notes=f"Imported by {current_user.first_name} {current_user.last_name}",
         )
-        
+
         logger.info(
-            f"Bank statement imported by {current_user.get('id')} "
+            f"Bank statement imported by {current_user.id} "
             f"for account {account_id} on {statement_date}"
         )
         
@@ -127,6 +163,7 @@ async def import_bank_statement(
 async def auto_match_transactions(
     reconciliation_id: str,
     body: AutoMatchRequest = AutoMatchRequest(),
+    current_user: User = Depends(require_permission("finance.bank_reconciliation.manage")),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -179,7 +216,7 @@ async def manually_match_transaction(
     bank_statement_id: str,
     journal_entry_id: str,
     body: ManualMatchRequest = ManualMatchRequest(),
-    current_user: dict = Depends(get_current_user),
+    current_user: User = Depends(require_permission("finance.bank_reconciliation.manage")),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -206,7 +243,7 @@ async def manually_match_transaction(
             school_id=school_id,
             bank_statement_id=bank_statement_id,
             journal_entry_id=journal_entry_id,
-            matched_by=current_user.get("id", "unknown"),
+            matched_by=current_user.id,
             variance_reason=variance_reason,
         )
         
@@ -302,6 +339,51 @@ async def get_reconciling_items(
         raise HTTPException(status_code=500, detail="Failed to calculate reconciling items")
 
 
+@router.post("/reconciling-items/{reconciliation_id}/create-adjustments", response_model=dict)
+async def create_reconciling_adjustments(
+    reconciliation_id: str,
+    current_user: User = Depends(require_permission("finance.bank_reconciliation.manage")),
+    school_id: str = Depends(get_current_school_id),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Create GL adjustment records for unmatched bank fee/interest items
+
+    Persists a BankReconciliationAdjustment (unposted) for each unmatched bank
+    statement line flagged as a FEE or INTEREST transaction — the step that
+    calculate_reconciling_items only ever summarized without recording.
+    Safe to call more than once: items already adjusted are skipped.
+
+    Args:
+        reconciliation_id: BankReconciliation ID
+        current_user: Current user (creator of the adjustments)
+        school_id: School identifier
+        session: Database session
+
+    Returns:
+        List of newly created adjustments (empty if there was nothing new)
+    """
+    try:
+        service = BankReconciliationService(session)
+        adjustments = await service.create_reconciliation_adjustments(
+            school_id=school_id,
+            reconciliation_id=reconciliation_id,
+            created_by=current_user.id,
+        )
+
+        return {
+            "status": "success",
+            "reconciliation_id": reconciliation_id,
+            "adjustments_created": len(adjustments),
+            "adjustments": adjustments,
+        }
+    except BankReconciliationError as e:
+        logger.warning(f"Error creating reconciliation adjustments: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error creating reconciliation adjustments: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to create reconciliation adjustments")
+
+
 @router.get("/summary/{reconciliation_id}", response_model=dict)
 async def get_reconciliation_summary(
     reconciliation_id: str,
@@ -341,7 +423,7 @@ async def get_reconciliation_summary(
 @router.post("/complete/{reconciliation_id}", response_model=dict)
 async def complete_reconciliation(
     reconciliation_id: str,
-    current_user: dict = Depends(get_current_user),
+    current_user: User = Depends(require_permission("finance.bank_reconciliation.manage")),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -366,14 +448,19 @@ async def complete_reconciliation(
         result = await service.complete_reconciliation(
             school_id=school_id,
             reconciliation_id=reconciliation_id,
-            approved_by=current_user.get("id", "unknown"),
+            approved_by=current_user.id,
         )
-        
+
         logger.info(
             f"Bank reconciliation {reconciliation_id} completed and approved by "
-            f"{current_user.get('id')}"
+            f"{current_user.id}"
         )
-        
+
+        await _log_gl_audit(
+            session, school_id, reconciliation_id, AuditActionType.RECONCILIATION_COMPLETED, current_user,
+            new_values={"completed_date": str(result["completed_date"]), "approved_by": result["approved_by"]},
+        )
+
         return {
             "status": "success",
             "reconciliation_id": reconciliation_id,

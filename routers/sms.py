@@ -9,15 +9,18 @@ from models.user import User, UserRole
 from models.student import Student, Parent, StudentParent
 from models.staff import Staff
 from models.communication import (
-    SMSNotification, 
-    SendSMSRequest, 
+    SMSNotification,
+    SendSMSRequest,
     SendFeeSMSRequest,
     SendAttendanceSMSRequest,
     SendAnnouncementSMSRequest,
-    Announcement
+    Announcement,
+    Message,
+    MessageType,
 )
 from auth import get_current_user, require_roles
 from services.sms_service import sms_service
+from services.broadcaster import broadcaster
 from database import get_session
 import logging
 
@@ -174,7 +177,37 @@ async def send_fee_reminder_sms(
     
     # Format phone number to include country code
     formatted_phone = sms_service.format_phone_number(parent.phone)
-    
+
+    # Fee reminders are otherwise a one-way text with no record the parent
+    # can act on in-app. When the parent has a portal account, also drop
+    # this as a real Message so it shows up in their chat inbox — same
+    # content, but now something they can reply to instead of just SMS.
+    if parent.user_id:
+        reminder_text = (
+            f"Dear Parent, {student.first_name} has outstanding fees: "
+            f"{request.amount_due}. Due: {request.due_date}. Please remit payment."
+        )
+        message = Message(
+            school_id=current_user.school_id,
+            sender_id=current_user.id,
+            receiver_id=parent.user_id,
+            subject="Fee Reminder",
+            content=reminder_text,
+            student_id=student.id,
+            message_type=MessageType.FEE,
+        )
+        session.add(message)
+        await session.commit()
+        try:
+            await broadcaster.publish({
+                "type": "new_message",
+                "school_id": current_user.school_id,
+                "sender_id": current_user.id,
+                "receiver_id": parent.user_id,
+            })
+        except Exception:
+            logger.exception('Failed to publish new_message event for fee reminder')
+
     async def send_task():
         try:
             result = await sms_service.send_fee_reminder_sms(
@@ -256,7 +289,44 @@ async def send_attendance_alert_sms(
     
     # Format phone number to include country code
     formatted_phone = sms_service.format_phone_number(request.phone_number)
-    
+
+    # Same in-app copy as fee-reminder above: if this student's parent has
+    # a portal account, drop the alert as a real Message too. Resolved via
+    # student_id (not request.phone_number) since a raw phone string isn't
+    # a reliable key back to a Parent row — formatting varies and numbers
+    # can be shared across a household.
+    parent_query = select(Parent).join(
+        StudentParent, StudentParent.parent_id == Parent.id
+    ).where(StudentParent.student_id == student.id)
+    parent_result = await session.execute(parent_query)
+    parent = parent_result.scalars().first()
+
+    if parent and parent.user_id:
+        alert_text = (
+            f"Alert: {student.first_name}'s attendance is "
+            f"{request.attendance_percentage}%. Please monitor."
+        )
+        message = Message(
+            school_id=current_user.school_id,
+            sender_id=current_user.id,
+            receiver_id=parent.user_id,
+            subject="Attendance Alert",
+            content=alert_text,
+            student_id=student.id,
+            message_type=MessageType.ATTENDANCE,
+        )
+        session.add(message)
+        await session.commit()
+        try:
+            await broadcaster.publish({
+                "type": "new_message",
+                "school_id": current_user.school_id,
+                "sender_id": current_user.id,
+                "receiver_id": parent.user_id,
+            })
+        except Exception:
+            logger.exception('Failed to publish new_message event for attendance alert')
+
     async def send_task():
         try:
             result = await sms_service.send_attendance_sms(

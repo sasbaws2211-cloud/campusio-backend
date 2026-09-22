@@ -351,34 +351,39 @@ class SettlementService:
         school_id: str
     ) -> float:
         """
-        Calculate school's settlement balance from database
-        
-        Formula: Total Fees Collected - Total Withdrawals
-        
-        NOTE: Only FeePayment is counted because:
-        - Manual fees → directly create FeePayment
-        - Online fees → create OnlineTransaction → create FeePayment
-        - Therefore all payments end up in FeePayment
-        - OnlineTransaction is just a tracker, not the actual fund source
-        
+        Calculate school's settlement balance from database — the amount
+        actually withdrawable via this Paystack-transfer flow.
+
+        Formula: Total ONLINE (Paystack) Fees Collected - Total Withdrawals
+
+        Previously this summed EVERY FeePayment regardless of method,
+        including cash/cheque/bank-transfer payments a bursar records at
+        the counter — money that never touches Paystack and therefore
+        cannot be "withdrawn from Paystack" by this flow at all. Scoped to
+        PaymentMethod.ONLINE_PAYMENT_PAYSTACK only, matching what a MoMo
+        transfer here can actually draw against.
+
         Args:
             session: Database session
             school_id: School ID
-        
+
         Returns:
             float: Balance in GHS (can be negative if over-withdrawn)
         """
         try:
+            from models.fee import PaymentMethod
             fee_payment_result = await session.execute(
                 select(func.sum(FeePayment.amount)).where(
-                    FeePayment.school_id == school_id
+                    FeePayment.school_id == school_id,
+                    FeePayment.payment_method == PaymentMethod.ONLINE_PAYMENT_PAYSTACK,
+                    FeePayment.voided == False,  # noqa: E712
                 )
             )
 
 
             total_collected = fee_payment_result.scalar() or 0
 
-            
+
             # Get total withdrawn (completed + pending withdrawals count as out)
             withdrawal_result = await session.execute(
                 select(func.sum(Withdrawal.amount)).where(
@@ -387,17 +392,17 @@ class SettlementService:
                 )
             )
             total_withdrawn = withdrawal_result.scalar() or 0
-            
+
             # Calculate balance
             balance = float(total_collected) - float(total_withdrawn)
-            
+
             logger.info(
                 f"Balance calculation for {school_id}: "
                 f"Collected={total_collected}, Withdrawn={total_withdrawn}, Balance={balance}"
             )
-            
+
             return balance
-        
+
         except Exception as e:
             logger.error(f"Error calculating school balance: {str(e)}")
             return 0.0
@@ -488,11 +493,34 @@ class SettlementService:
             if withdrawal.status != new_status:
                 old_status = withdrawal.status
                 withdrawal.status = new_status
-                
+
+                journal_entry_id = None
                 if new_status == WithdrawalStatus.COMPLETED:
                     withdrawal.completed_at = datetime.utcnow()
                     logger.info(f"⏰ [UPDATE] Set completed_at timestamp")
-                
+
+                    if paystack_data:
+                        fee_value = paystack_data.get("fees") or paystack_data.get("fee")
+                        if fee_value is not None:
+                            try:
+                                withdrawal.transfer_fee = round(float(fee_value) / 100, 2)  # Paystack amounts are in kobo/pesewas
+                            except (TypeError, ValueError):
+                                pass
+
+                    # Post the withdrawal to the GL — previously a
+                    # completed withdrawal never touched the ledger at
+                    # all, so GL 1010 (Business Checking) stayed
+                    # permanently overstated by every completed withdrawal
+                    # forever, and Paystack's transfer fee was invisible.
+                    try:
+                        from services import fee_gl_service
+                        session.add(withdrawal)
+                        await session.flush()
+                        journal_entry_id = await fee_gl_service.post_settlement_withdrawal(session, withdrawal.school_id, withdrawal)
+                        withdrawal.journal_entry_id = journal_entry_id
+                    except Exception as e:
+                        logger.error(f"Error posting settlement journal entry for withdrawal {withdrawal.id}: {str(e)}")
+
                 await session.commit()
                 logger.info(
                     f"✅ [UPDATE] SUCCESS: Updated withdrawal {transfer_code} "

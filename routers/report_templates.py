@@ -5,10 +5,15 @@ from sqlmodel import select
 from typing import List
 from database import get_session
 from models import ReportTemplate, ReportTemplateCreate, ReportTemplateUpdate, ReportTemplateResponse
-from auth import get_current_user
-from models.user import User
+from auth import get_current_user, require_roles
+from models.user import User, UserRole
+from services.plan_gating import require_plan_feature
 
-router = APIRouter(prefix="/report-templates", tags=["report-templates"])
+router = APIRouter(
+    prefix="/report-templates", tags=["report-templates"],
+    dependencies=[Depends(require_plan_feature("academic_reports"))],
+)
+WRITE_ROLES = (UserRole.SUPER_ADMIN, UserRole.SCHOOL_ADMIN)
 
 
 async def get_school_id(current_user: User = Depends(get_current_user)) -> str:
@@ -25,7 +30,7 @@ async def get_school_id(current_user: User = Depends(get_current_user)) -> str:
 async def create_template(
     template_data: ReportTemplateCreate,
     session: AsyncSession = Depends(get_session),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_roles(*WRITE_ROLES)),
     school_id: str = Depends(get_school_id)
 ):
     """Create a new report card template"""
@@ -102,7 +107,7 @@ async def update_template(
     template_id: str,
     template_data: ReportTemplateUpdate,
     session: AsyncSession = Depends(get_session),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_roles(*WRITE_ROLES)),
     school_id: str = Depends(get_school_id)
 ):
     """Update a report template"""
@@ -149,7 +154,7 @@ async def update_template(
 async def delete_template(
     template_id: str,
     session: AsyncSession = Depends(get_session),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_roles(*WRITE_ROLES)),
     school_id: str = Depends(get_school_id)
 ):
     """Delete a report template"""
@@ -173,7 +178,7 @@ async def delete_template(
 async def set_default_template(
     template_id: str,
     session: AsyncSession = Depends(get_session),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_roles(*WRITE_ROLES)),
     school_id: str = Depends(get_school_id)
 ):
     """Set a template as the default for the school"""

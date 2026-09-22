@@ -49,6 +49,16 @@ class AuditActionType(str, Enum):
     RECONCILIATION_COMPLETED = "reconciliation_completed"
     OPENING_BALANCE_IMPORTED = "opening_balance_imported"
 
+    # Payroll changes — previously payroll had zero audit-log coverage
+    # despite being one of the most sensitive financial data flows in the
+    # system (every other finance-sensitive flow this session got this).
+    PAYROLL_GENERATED = "payroll_generated"
+    PAYROLL_APPROVED = "payroll_approved"
+    PAYROLL_REJECTED = "payroll_rejected"
+    PAYROLL_POSTED = "payroll_posted"
+    PAYROLL_VOIDED = "payroll_voided"
+    PAYROLL_DISBURSED = "payroll_disbursed"
+
 
 class AuditEntityType(str, Enum):
     """Type of entity being audited"""
@@ -57,6 +67,7 @@ class AuditEntityType(str, Enum):
     EXPENSE = "expense"
     FISCAL_PERIOD = "fiscal_period"
     BANK_RECONCILIATION = "bank_reconciliation"
+    PAYROLL_RUN = "payroll_run"
 
 
 class GLAuditLog(SQLModel, table=True):

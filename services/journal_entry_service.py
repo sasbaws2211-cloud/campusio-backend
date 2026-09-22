@@ -24,7 +24,9 @@ from models.finance import (
     ReferenceType,
 )
 from models.finance.chart_of_accounts import GLAccount
+from models.school import School
 from services.coa_service import CoaService
+from services.fiscal_period_service import FiscalPeriodService
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,18 @@ class JournalEntryService:
         """
         self.session = session
         self.coa_service = CoaService(session)
+        self.fiscal_period_service = FiscalPeriodService(session)
+
+    async def requires_maker_checker(self, school_id: str) -> bool:
+        """Whether this school has segregation-of-duties enabled
+
+        Off by default (School.require_maker_checker) — small schools with a
+        single finance staffer can't otherwise use the approval workflow.
+        """
+        result = await self.session.execute(
+            select(School.require_maker_checker).where(School.id == school_id)
+        )
+        return bool(result.scalar_one_or_none())
     
     # ==================== Entry Creation ====================
     
@@ -96,7 +110,14 @@ class JournalEntryService:
         # Calculate totals
         total_debit = sum(item.debit_amount for item in entry_data.line_items)
         total_credit = sum(item.credit_amount for item in entry_data.line_items)
-        
+
+        # Resolve which fiscal period this entry falls into (by entry_date) so
+        # post_entry() can enforce the period's lock/close status later. A None
+        # here just means no period is configured for that date — posting is
+        # then unrestricted, matching today's behavior.
+        period = await self.fiscal_period_service.get_period_by_date(school_id, entry_data.entry_date)
+        fiscal_period_id = period.id if period else None
+
         # Create entry
         entry = JournalEntry(
             school_id=school_id,
@@ -107,6 +128,9 @@ class JournalEntryService:
             total_debit=total_debit,
             total_credit=total_credit,
             posting_status=PostingStatus.DRAFT,
+            fiscal_period_id=fiscal_period_id,
+            is_adjusting_entry=entry_data.is_adjusting_entry,
+            auto_reverse_date=entry_data.auto_reverse_date,
             created_by=created_by,
             notes=entry_data.notes,
         )
@@ -163,10 +187,10 @@ class JournalEntryService:
         # Validate line items
         has_debit = False
         has_credit = False
-        total_debit = 0.0
-        total_credit = 0.0
+        total_debit = Decimal("0")
+        total_credit = Decimal("0")
         accounts_to_check = set()
-        
+
         for line in entry_data.line_items:
             # Check that exactly one of debit/credit is > 0
             if line.debit_amount > 0 and line.credit_amount > 0:
@@ -199,7 +223,7 @@ class JournalEntryService:
             }
         
         # Check debits = credits (allow for rounding to 2 decimal places)
-        if abs(total_debit - total_credit) > 0.01:
+        if abs(total_debit - total_credit) > Decimal("0.01"):
             return {
                 "valid": False,
                 "error": f"Debits ({total_debit:.2f}) do not equal credits ({total_credit:.2f})"
@@ -286,18 +310,13 @@ class JournalEntryService:
                 ).order_by(JournalEntry.entry_date.desc())
             )
             entries = result.scalars().all()
-            
-            return [
-                {
-                    "id": e.id,
-                    "entry_date": e.entry_date,
-                    "description": e.description,
-                    "total_debit": e.total_debit,
-                    "total_credit": e.total_credit,
-                    "posting_status": e.posting_status,
-                }
-                for e in entries
-            ]
+
+            # Same full shape as get_entry_by_id/get_entries_filtered — this
+            # previously returned a partial dict missing school_id,
+            # reference_type, created_by, etc., which JournalEntryResponse
+            # requires, so the /reference/{type}/{id} endpoint 500'd
+            # whenever a match existed.
+            return [await self._entry_to_dict(e, include_line_items=False) for e in entries]
         except Exception as e:
             logger.error(f"Error fetching entries for reference {reference_id}: {str(e)}")
             return []
@@ -368,30 +387,53 @@ class JournalEntryService:
         
         # Check if entry is adjusting
         is_adjusting = getattr(entry, 'is_adjusting_entry', False)
-        
-        # ⭐ CRITICAL: Update GL account balances
+
+        # Enforce fiscal period locking: a LOCKED/CLOSED period rejects new
+        # postings (adjusting entries may still be allowed into a LOCKED
+        # period if the period permits it — see can_post_to_period).
+        if entry.fiscal_period_id:
+            can_post, reason = await self.fiscal_period_service.can_post_to_period(
+                school_id, entry.fiscal_period_id, is_adjustment_entry=is_adjusting,
+            )
+            if not can_post:
+                raise JournalEntryError(f"Cannot post entry: {reason}")
+
+        # ⭐ CRITICAL: Update GL account balances and flip entry status as a
+        # single transaction — either all of it lands, or none of it does.
+        # (update_account_balance(commit=False) stages the change but leaves
+        # committing to us, so a failure partway through the loop rolls back
+        # every balance change already staged, instead of leaving the ledger
+        # half-posted.)
         try:
             for line_item in line_items:
-                await self.coa_service.update_account_balance(
+                updated = await self.coa_service.update_account_balance(
                     school_id=school_id,
                     account_id=line_item.gl_account_id,
                     debit_amount=line_item.debit_amount,
                     credit_amount=line_item.credit_amount,
+                    commit=False,
                 )
+                if updated is None:
+                    raise JournalEntryError(
+                        f"GL account {line_item.gl_account_id} not found while posting"
+                    )
+
+            entry.posting_status = PostingStatus.POSTED
+            entry.posted_date = datetime.utcnow()
+            entry.posted_by = posted_by
+            entry.posted_ip = ip_address
+            entry.notes = approval_notes or entry.notes
+            entry.updated_at = datetime.utcnow()
+
+            self.session.add(entry)
+            await self.session.commit()
+            await self.session.refresh(entry)
+        except JournalEntryError:
+            await self.session.rollback()
+            raise
         except Exception as e:
+            await self.session.rollback()
             raise JournalEntryError(f"Failed to update GL account balances: {str(e)}")
-        
-        # Update entry status
-        entry.posting_status = PostingStatus.POSTED
-        entry.posted_date = datetime.utcnow()
-        entry.posted_by = posted_by
-        entry.posted_ip = ip_address
-        entry.notes = approval_notes or entry.notes
-        entry.updated_at = datetime.utcnow()
-        
-        self.session.add(entry)
-        await self.session.commit()
-        await self.session.refresh(entry)
         
         logger.info(
             f"Posted journal entry {entry_id} ({entry.reference_type.value}) "
@@ -403,6 +445,29 @@ class JournalEntryService:
     
     # ==================== Entry Reversal ====================
     
+    async def assert_reversal_allowed(self, school_id: str, original_entry: JournalEntry, reversed_by: str) -> None:
+        """Segregation of duties for reversals — previously NO reversal
+        path checked this at all, unlike normal manual-entry posting
+        (routers/finance/journal.py blocks a creator from also posting
+        their own entry). Without this, a single user with reversal
+        permission could unilaterally create AND post a real, GL-impacting
+        correcting entry against their own work, even at a school with
+        segregation-of-duties turned on — exactly the scenario that
+        control exists to catch. Never blocks reversing a SYSTEM-generated
+        original entry (fee payments, depreciation, etc.) — reversing an
+        automated posting isn't a human "cheating" the control; it's
+        exactly what void_payment and similar flows are supposed to do."""
+        if original_entry.created_by == "SYSTEM" or original_entry.posted_by == "SYSTEM":
+            return
+        result = await self.session.execute(select(School.require_maker_checker).where(School.id == school_id))
+        if not bool(result.scalar_one_or_none()):
+            return
+        if original_entry.created_by == reversed_by or original_entry.posted_by == reversed_by:
+            raise JournalEntryError(
+                "Segregation of duties: you created or posted this entry and cannot also reverse it — "
+                "ask another finance user to reverse it"
+            )
+
     async def reverse_entry(
         self,
         school_id: str,
@@ -441,7 +506,9 @@ class JournalEntryService:
                 f"Can only reverse POSTED entries "
                 f"(current status: {original_entry.posting_status.value})"
             )
-        
+
+        await self.assert_reversal_allowed(school_id, original_entry, reversed_by)
+
         # Get line items
         result = await self.session.execute(
             select(JournalLineItem).where(
@@ -463,7 +530,12 @@ class JournalEntryService:
                 )
             )
         
-        # Create reversal entry
+        # Create reversal entry. Dated "now" (not the original entry's date),
+        # so if the *current* period has been LOCKED for audit, this would
+        # otherwise be blocked from posting at all — a reversal is exactly
+        # the kind of corrective action a LOCKED (not CLOSED) period is
+        # still supposed to allow, so it's marked as an adjusting entry the
+        # same way RetainedEarningsService's closing entry is.
         reversal_entry_data = JournalEntryCreate(
             entry_date=datetime.utcnow(),
             reference_type=ReferenceType.ADJUSTMENT,
@@ -471,6 +543,7 @@ class JournalEntryService:
             description=f"Reversal of {original_entry.reference_type.value} - {reversal_reason}",
             line_items=reversal_line_items,
             notes=reversal_notes or "",
+            is_adjusting_entry=True,
         )
         
         # Create the reversal entry
@@ -531,39 +604,48 @@ class JournalEntryService:
             Dict with total_debit, total_credit, by_account details
         """
         try:
-            # Get all posted entries up to as_of_date
-            query = select(JournalLineItem).where(
-                and_(
-                    JournalLineItem.school_id == school_id,
-                    # Only include line items from posted entries
-                )
-            )
-            
+            # Line items from DRAFT entries never touched the GL and must be
+            # excluded, or this trial balance would disagree with the
+            # canonical one in services/reports_service.py (which already
+            # gets this right). REVERSED is included alongside POSTED: a
+            # reversed entry *was* posted, and its reversal is a separate,
+            # also-posted contra-entry -- both legs must be included for them
+            # to net to zero together.
+            conditions = [
+                JournalLineItem.school_id == school_id,
+                JournalEntry.id == JournalLineItem.journal_entry_id,
+                JournalEntry.posting_status.in_([PostingStatus.POSTED, PostingStatus.REVERSED]),
+            ]
+            if as_of_date is not None:
+                cutoff = as_of_date.replace(tzinfo=None) if as_of_date.tzinfo else as_of_date
+                conditions.append(JournalEntry.entry_date <= cutoff)
+            query = select(JournalLineItem).where(and_(*conditions))
+
             result = await self.session.execute(query)
             line_items = result.scalars().all()
             
             # Calculate by account
             by_account = {}
-            total_debit = 0.0
-            total_credit = 0.0
-            
+            total_debit = Decimal("0")
+            total_credit = Decimal("0")
+
             for li in line_items:
                 if li.gl_account_id not in by_account:
                     by_account[li.gl_account_id] = {
-                        "debit": 0.0,
-                        "credit": 0.0,
+                        "debit": Decimal("0"),
+                        "credit": Decimal("0"),
                     }
-                
+
                 by_account[li.gl_account_id]["debit"] += li.debit_amount
                 by_account[li.gl_account_id]["credit"] += li.credit_amount
-                
+
                 total_debit += li.debit_amount
                 total_credit += li.credit_amount
-            
+
             return {
                 "total_debit": total_debit,
                 "total_credit": total_credit,
-                "balanced": abs(total_debit - total_credit) < 0.01,
+                "balanced": abs(total_debit - total_credit) < Decimal("0.01"),
                 "by_account": by_account,
             }
             
@@ -609,7 +691,7 @@ class JournalEntryService:
                 "draft": 0,
                 "reversed": 0,
                 "rejected": 0,
-                "total_posted_amount": 0.0,
+                "total_posted_amount": Decimal("0"),
             }
             
             for entry in entries:
@@ -746,8 +828,8 @@ class JournalEntryService:
                     await self.session.delete(line)
                 
                 # Create new line items with validation
-                total_debit = 0.0
-                total_credit = 0.0
+                total_debit = Decimal("0")
+                total_credit = Decimal("0")
                 
                 for line_num, line_data in enumerate(update_data.line_items, 1):
                     line_item = JournalLineItem(

@@ -10,8 +10,11 @@ to maintain the balance sheet equation:
 from sqlmodel import SQLModel, Field
 from typing import Optional, List
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 import uuid
+
+from .chart_of_accounts import MONEY_MAX_DIGITS, MONEY_DECIMAL_PLACES, Money
 
 
 class PostingStatus(str, Enum):
@@ -33,6 +36,11 @@ class ReferenceType(str, Enum):
     PERIOD_CLOSING = "period_closing"     # Year-end or period close
     BANK_RECONCILIATION = "bank_reconciliation"  # Bank clearing
     PLATFORM_SUBSCRIPTION = "platform_subscription"  # Platform usage fee
+    ASSET_DISPOSAL = "asset_disposal"     # Fixed-asset disposal write-off + gain/loss
+    FEE_INVOICE = "fee_invoice"           # Revenue recognized at fee invoice time (Dr AR / Cr Revenue)
+    REFUND = "refund"                     # Refund liability recognized, or a refund actually paid out
+    WRITE_OFF = "write_off"               # Uncollectable fee balance formally written off
+    SETTLEMENT_WITHDRAWAL = "settlement_withdrawal"  # Paystack clearing -> real bank/MoMo
 
 
 class JournalEntry(SQLModel, table=True):
@@ -57,9 +65,10 @@ class JournalEntry(SQLModel, table=True):
     reference_id: Optional[str] = None  # Link to source: payroll_run_id, fee_payment_id, etc.
     description: str  # Human-readable description of transaction
     
-    # Amounts
-    total_debit: float = Field(ge=0.0)
-    total_credit: float = Field(ge=0.0)
+    # Amounts — Decimal/Numeric, not float, so debit=credit comparisons are
+    # exact rather than subject to binary-float rounding.
+    total_debit: Decimal = Field(ge=Decimal("0"), max_digits=MONEY_MAX_DIGITS, decimal_places=MONEY_DECIMAL_PLACES)
+    total_credit: Decimal = Field(ge=Decimal("0"), max_digits=MONEY_MAX_DIGITS, decimal_places=MONEY_DECIMAL_PLACES)
     
     # Status tracking
     posting_status: PostingStatus = Field(default=PostingStatus.DRAFT, index=True)
@@ -71,6 +80,10 @@ class JournalEntry(SQLModel, table=True):
     fiscal_period_id: Optional[str] = None  # Link to fiscal period ⭐ NEW
     cutoff_period: Optional[int] = None  # Which period does this belong to ⭐ NEW
     is_adjusting_entry: bool = Field(default=False)  # Is this a period-end adjustment? ⭐ NEW
+    # If set on a POSTED adjusting entry (e.g. an accrual), it's a candidate
+    # for RecurringEntryService.reverse_due_accruals() once this date arrives —
+    # nothing reverses it automatically before then.
+    auto_reverse_date: Optional[datetime] = None
     
     # Rejection tracking (if applicable)
     rejection_reason: Optional[str] = None
@@ -106,8 +119,12 @@ class JournalLineItem(SQLModel, table=True):
     gl_account_id: str = Field(index=True)  # FK to GLAccount
     
     # Amount (either debit or credit, not both)
-    debit_amount: float = Field(default=0.0, ge=0.0)
-    credit_amount: float = Field(default=0.0, ge=0.0)
+    debit_amount: Decimal = Field(
+        default=Decimal("0"), ge=Decimal("0"), max_digits=MONEY_MAX_DIGITS, decimal_places=MONEY_DECIMAL_PLACES
+    )
+    credit_amount: Decimal = Field(
+        default=Decimal("0"), ge=Decimal("0"), max_digits=MONEY_MAX_DIGITS, decimal_places=MONEY_DECIMAL_PLACES
+    )
     
     # Description (can override entry description for detail)
     description: Optional[str] = None
@@ -124,8 +141,8 @@ class JournalLineItem(SQLModel, table=True):
 class JournalLineItemCreate(SQLModel):
     """Validation model for creating journal line items"""
     gl_account_id: str
-    debit_amount: float = 0.0
-    credit_amount: float = 0.0
+    debit_amount: Decimal = Decimal("0")
+    credit_amount: Decimal = Decimal("0")
     description: Optional[str] = None
     line_number: int = 0
 
@@ -135,8 +152,8 @@ class JournalLineItemResponse(SQLModel):
     id: str
     journal_entry_id: str
     gl_account_id: str
-    debit_amount: float
-    credit_amount: float
+    debit_amount: Money
+    credit_amount: Money
     description: Optional[str]
     line_number: int
     created_at: datetime
@@ -154,6 +171,14 @@ class JournalEntryCreate(SQLModel):
     description: str
     line_items: List[JournalLineItemCreate]
     notes: Optional[str] = None
+    # Adjusting entries (period-closing, accruals) may still post into a
+    # LOCKED fiscal period if that period allows adjustments — see
+    # FiscalPeriodService.can_post_to_period(). Defaults False for normal
+    # entries, which a LOCKED period always rejects.
+    is_adjusting_entry: bool = False
+    # Set for accruals that should auto-reverse on a known future date (see
+    # JournalEntry.auto_reverse_date).
+    auto_reverse_date: Optional[datetime] = None
 
 
 class JournalEntryUpdate(SQLModel):
@@ -175,8 +200,8 @@ class JournalEntryResponse(SQLModel):
     reference_type: ReferenceType
     reference_id: Optional[str]
     description: str
-    total_debit: float
-    total_credit: float
+    total_debit: Money
+    total_credit: Money
     posting_status: PostingStatus
     posted_date: Optional[datetime]
     posted_by: Optional[str]
@@ -209,7 +234,7 @@ class JournalEntrySummary(SQLModel):
     reversed_entries: int
     rejected_entries: int
     total_postings: int
-    total_amount: float
+    total_amount: Money
 
 
 class TrialBalance(SQLModel):
@@ -219,6 +244,6 @@ class TrialBalance(SQLModel):
     """
     account_code: str
     account_name: str
-    debit_balance: float
-    credit_balance: float
-    total_balance: float
+    debit_balance: Money
+    credit_balance: Money
+    total_balance: Money

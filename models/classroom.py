@@ -1,6 +1,6 @@
 """Class and Subject models"""
 from sqlmodel import SQLModel, Field
-from sqlalchemy import Column, String, ForeignKey
+from sqlalchemy import Column, String, ForeignKey, UniqueConstraint
 from typing import Optional
 from datetime import datetime
 from enum import Enum
@@ -23,7 +23,8 @@ class ClassLevel(str, Enum):
 
 class Class(SQLModel, table=True):
     __tablename__ = "classes"
-    
+    __table_args__ = (UniqueConstraint("school_id", "name", "level", "section", name="uq_classes_school_name_level_section"),)
+
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
     school_id: str = Field(index=True)
     name: str
@@ -35,6 +36,7 @@ class Class(SQLModel, table=True):
         default=None,
         sa_column=Column(String, ForeignKey("academic_terms.id", ondelete="SET NULL"), index=True)
     )
+    campus_id: Optional[str] = Field(default=None, index=True)
     is_active: bool = True
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
@@ -47,6 +49,19 @@ class ClassCreate(SQLModel):
     capacity: int = 40
     room_number: Optional[str] = None
     academic_term_id: Optional[str] = None
+    campus_id: Optional[str] = None
+
+
+class ClassUpdate(SQLModel):
+    """Partial update — only fields the caller actually sets are applied."""
+    name: Optional[str] = None
+    level: Optional[ClassLevel] = None
+    section: Optional[str] = None
+    capacity: Optional[int] = None
+    room_number: Optional[str] = None
+    academic_term_id: Optional[str] = None
+    campus_id: Optional[str] = None
+    is_active: Optional[bool] = None
 
 
 class SubjectCategory(str, Enum):
@@ -56,7 +71,8 @@ class SubjectCategory(str, Enum):
 
 class Subject(SQLModel, table=True):
     __tablename__ = "subjects"
-    
+    __table_args__ = (UniqueConstraint("school_id", "code", name="uq_subjects_school_code"),)
+
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
     school_id: str = Field(index=True)
     name: str
@@ -78,9 +94,21 @@ class SubjectCreate(SQLModel):
 
 class ClassSubject(SQLModel, table=True):
     __tablename__ = "class_subjects"
-    
+
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
     school_id: str = Field(index=True)
     class_id: str = Field(index=True)
     subject_id: str = Field(index=True)
     academic_term_id: str = Field(sa_column=Column(String, ForeignKey("academic_terms.id", ondelete="CASCADE"), index=True))
+
+
+class ClassWaitlistEntry(SQLModel, table=True):
+    __tablename__ = "class_waitlist_entries"
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    school_id: str = Field(index=True)
+    student_id: str = Field(index=True)
+    class_id: str = Field(index=True)
+    position: int
+    requested_at: datetime = Field(default_factory=datetime.utcnow)
+    status: str = "waiting"  # waiting | offered | enrolled | cancelled

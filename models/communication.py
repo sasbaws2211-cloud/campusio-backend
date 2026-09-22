@@ -67,7 +67,7 @@ class Message(SQLModel, table=True):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
     school_id: str = Field(index=True)
     sender_id: str = Field(index=True)
-    receiver_id: str = Field(index=True)
+    receiver_id: Optional[str] = Field(default=None, index=True)  # None for a group message (see conversation_id)
     subject: str
     content: str
     is_read: bool = False
@@ -76,6 +76,7 @@ class Message(SQLModel, table=True):
     student_id: Optional[str] = Field(default=None, index=True)  # Which student conversation is about
     class_id: Optional[str] = Field(default=None, index=True)  # Which class context
     message_type: MessageType = MessageType.GENERAL  # Type of message for filtering
+    conversation_id: Optional[str] = Field(default=None, index=True)  # Set for group-conversation messages; see models/group_conversation.py
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 

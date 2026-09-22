@@ -27,7 +27,7 @@ from models.billing import (
     PlatformSubscriptionResponse, SubscriptionInvoiceResponse,
     SubscriptionMetrics, BillingConfiguration, BillingPlan
 )
-from models.school import AcademicTerm
+from models.school import AcademicTerm, School
 from models.student import Student, StudentStatus
 from models.payment import OnlineTransaction, TransactionStatus, TransactionType
 from services.paystack_service import PaystackService
@@ -38,10 +38,12 @@ logger = logging.getLogger(__name__)
 
 def subscription_outstanding(subscription: PlatformSubscription) -> float:
     """The single source of truth for what a school still owes on a
-    subscription: base amount plus late fees, minus discounts and payments."""
+    subscription: base amount plus late fees plus mid-term proration charges,
+    minus discounts and payments."""
     grand_total = (
         subscription.total_amount_due
         + subscription.late_fee_amount
+        + subscription.proration_adjustment
         - subscription.discount_amount
     )
     return round(grand_total - subscription.amount_paid, 2)
@@ -79,12 +81,32 @@ async def mark_transaction_refunded(
     if amount is not None:
         transaction.refund_amount = round(amount, 2)
     transaction.updated_at = datetime.utcnow()
+
+    # Post the refund actually leaving the account — but ONLY for a school
+    # FEE transaction. A SUBSCRIPTION (platform billing) refund must never
+    # touch a school's own GL — this module's own rule above is "no writes
+    # to the school's GL: platform fees are Campusio revenue, not school
+    # revenue." Previously this whole function posted nothing either way;
+    # a fee refund left revenue permanently overstated by the refunded
+    # amount with no GL reversal at all.
+    refund_journal_entry_id = None
+    if transaction.transaction_type == TransactionType.FEE and transaction.refund_amount:
+        try:
+            from services import fee_gl_service
+            refund_journal_entry_id = await fee_gl_service.post_refund_payout(
+                session, transaction.school_id, transaction, transaction.refund_amount, cash_account_code="1040",
+            )
+            transaction.refund_payout_journal_entry_id = refund_journal_entry_id
+        except Exception as e:
+            logger.error(f"Error posting refund payout journal entry for transaction {transaction.id}: {str(e)}")
+
     await session.commit()
 
     return {
         "success": True,
         "transaction_id": transaction.id,
         "refund_amount": transaction.refund_amount,
+        "journal_entry_id": refund_journal_entry_id,
         "message": "Refund marked as completed",
     }
 
@@ -223,7 +245,8 @@ class PlatformBillingService:
                 billing_plan=plan,
                 billing_month=billing_month,
                 due_date=due_date,
-                status=SubscriptionStatus.PENDING
+                status=SubscriptionStatus.PENDING,
+                reconciled_student_count=student_count,
             )
 
             session.add(subscription)
@@ -586,6 +609,125 @@ class PlatformBillingService:
             await session.rollback()
             return {"success": False, "error": str(e)}
     
+    async def process_auto_renewal(self, session: AsyncSession, subscription: PlatformSubscription) -> Dict:
+        """Attempt to auto-charge a school's saved card for a due/overdue
+        subscription. Called from services/scheduler.py's daily job — never
+        raises, only reports what happened, so one school's failed card
+        never stops the run for the rest. Falls through to the existing
+        manual-checkout / reminder / suspension flow whenever there's no
+        saved card, auto-renew is off, or the charge is declined."""
+        try:
+            amount_due = subscription_outstanding(subscription)
+            if amount_due <= 0:
+                return {"success": True, "skipped": "nothing owed"}
+
+            config_result = await session.execute(
+                select(BillingConfiguration).where(BillingConfiguration.school_id == subscription.school_id)
+            )
+            config = config_result.scalar_one_or_none()
+            if not config or not config.auto_renew_enabled or not config.paystack_authorization_code:
+                return {"success": True, "skipped": "no saved card or auto-renew disabled"}
+
+            school_result = await session.execute(select(School).where(School.id == subscription.school_id))
+            school = school_result.scalar_one_or_none()
+            if not school or not school.email:
+                return {"success": True, "skipped": "school has no billing email on file"}
+
+            # Same idempotency guard as initiate_subscription_payment — don't
+            # start a second attempt while one is already in flight.
+            existing_result = await session.execute(
+                select(OnlineTransaction).where(
+                    OnlineTransaction.fee_id == subscription.id,
+                    OnlineTransaction.transaction_type == TransactionType.SUBSCRIPTION,
+                    OnlineTransaction.status.in_([TransactionStatus.PENDING, TransactionStatus.PROCESSING]),
+                )
+            )
+            if existing_result.scalars().first():
+                return {"success": True, "skipped": "payment already in flight"}
+
+            transaction_id = f"PLAT-{uuid.uuid4().hex[:12].upper()}"
+            transaction = OnlineTransaction(
+                school_id=subscription.school_id,
+                fee_id=subscription.id,
+                student_id="",
+                parent_id="",
+                amount=amount_due,
+                gateway="paystack",
+                reference=transaction_id,
+                transaction_type=TransactionType.SUBSCRIPTION,
+                status=TransactionStatus.PENDING,
+            )
+            session.add(transaction)
+            await session.flush()
+
+            charge_result = await self.paystack.charge_authorization(
+                authorization_code=config.paystack_authorization_code,
+                amount_kobo=int(round(amount_due * 100)),
+                email=school.email,
+                reference=transaction_id,
+                metadata={
+                    "type": "platform_subscription_auto_renewal",
+                    "subscription_id": subscription.id,
+                    "school_id": subscription.school_id,
+                },
+            )
+
+            if not charge_result.get("success"):
+                transaction.status = TransactionStatus.FAILED
+                transaction.failed_reason = charge_result.get("error", "Auto-charge request failed")
+                await session.commit()
+                logger.warning(f"Auto-renewal charge request failed for subscription {subscription.id}: {charge_result.get('error')}")
+                return {"success": False, "error": charge_result.get("error")}
+
+            if charge_result.get("status") != "success":
+                gateway_msg = (charge_result.get("data") or {}).get("gateway_response", "declined")
+                transaction.status = TransactionStatus.FAILED
+                transaction.failed_reason = f"Card declined: {gateway_msg}"
+                await session.commit()
+                logger.warning(f"Auto-renewal charge declined for subscription {subscription.id}: {gateway_msg}")
+                return {"success": False, "error": transaction.failed_reason}
+
+            # Charged successfully on Paystack's side — apply it to the
+            # ledger the same way the webhook would. The webhook will also
+            # fire for this same reference; verify_and_process_payment's
+            # row-lock + status check makes applying it twice a no-op.
+            await session.commit()
+
+            apply_result = await self.verify_and_process_payment(
+                session=session,
+                transaction_id=transaction.id,
+                reference=transaction_id,
+                amount_paid=amount_due,
+            )
+            logger.info(f"Auto-renewal charged and applied for subscription {subscription.id}: GHS {amount_due}")
+            return apply_result
+
+        except Exception as e:
+            logger.error(f"Error processing auto-renewal for subscription {subscription.id}: {str(e)}")
+            await session.rollback()
+            return {"success": False, "error": str(e)}
+
+    @staticmethod
+    def _to_response(sub: PlatformSubscription) -> PlatformSubscriptionResponse:
+        return PlatformSubscriptionResponse(
+            id=sub.id,
+            school_id=sub.school_id,
+            academic_term_id=sub.academic_term_id,
+            student_count=sub.student_count,
+            unit_price=sub.unit_price,
+            total_amount_due=sub.total_amount_due,
+            amount_paid=sub.amount_paid,
+            proration_adjustment=sub.proration_adjustment,
+            outstanding_balance=subscription_outstanding(sub),
+            status=sub.status,
+            billing_plan=sub.billing_plan if isinstance(sub.billing_plan, str) else sub.billing_plan.value,
+            billing_month=sub.billing_month,
+            billing_date=sub.billing_date,
+            due_date=sub.due_date,
+            paid_at=sub.paid_at,
+            created_at=sub.created_at
+        )
+
     async def get_subscription(
         self,
         session: AsyncSession,
@@ -598,27 +740,12 @@ class PlatformBillingService:
             )
         )
         sub = result.scalar_one_or_none()
-        
+
         if not sub:
             return None
-        
-        return PlatformSubscriptionResponse(
-            id=sub.id,
-            school_id=sub.school_id,
-            academic_term_id=sub.academic_term_id,
-            student_count=sub.student_count,
-            unit_price=sub.unit_price,
-            total_amount_due=sub.total_amount_due,
-            amount_paid=sub.amount_paid,
-            status=sub.status,
-            billing_plan=sub.billing_plan if isinstance(sub.billing_plan, str) else sub.billing_plan.value,
-            billing_month=sub.billing_month,
-            billing_date=sub.billing_date,
-            due_date=sub.due_date,
-            paid_at=sub.paid_at,
-            created_at=sub.created_at
-        )
-    
+
+        return self._to_response(sub)
+
     async def get_school_current_subscription(
         self,
         session: AsyncSession,
@@ -631,27 +758,12 @@ class PlatformBillingService:
             .order_by(PlatformSubscription.created_at.desc())
         )
         sub = result.scalars().first()
-        
+
         if not sub:
             return None
-        
-        return PlatformSubscriptionResponse(
-            id=sub.id,
-            school_id=sub.school_id,
-            academic_term_id=sub.academic_term_id,
-            student_count=sub.student_count,
-            unit_price=sub.unit_price,
-            total_amount_due=sub.total_amount_due,
-            amount_paid=sub.amount_paid,
-            status=sub.status,
-            billing_plan=sub.billing_plan if isinstance(sub.billing_plan, str) else sub.billing_plan.value,
-            billing_month=sub.billing_month,
-            billing_date=sub.billing_date,
-            due_date=sub.due_date,
-            paid_at=sub.paid_at,
-            created_at=sub.created_at
-        )
-    
+
+        return self._to_response(sub)
+
     async def get_school_subscriptions(
         self,
         session: AsyncSession,
@@ -668,26 +780,8 @@ class PlatformBillingService:
             .offset(offset)
         )
         subs = result.scalars().all()
-        
-        return [
-            PlatformSubscriptionResponse(
-                id=sub.id,
-                school_id=sub.school_id,
-                academic_term_id=sub.academic_term_id,
-                student_count=sub.student_count,
-                unit_price=sub.unit_price,
-                total_amount_due=sub.total_amount_due,
-                amount_paid=sub.amount_paid,
-                status=sub.status,
-                billing_plan=sub.billing_plan if isinstance(sub.billing_plan, str) else sub.billing_plan.value,
-                billing_month=sub.billing_month,
-                billing_date=sub.billing_date,
-                due_date=sub.due_date,
-                paid_at=sub.paid_at,
-                created_at=sub.created_at
-            )
-            for sub in subs
-        ]
+
+        return [self._to_response(sub) for sub in subs]
     
     async def get_school_invoices(
         self,
@@ -730,16 +824,27 @@ class PlatformBillingService:
         school_id: str
     ) -> Optional[SubscriptionMetrics]:
         """Get subscription metrics for dashboard"""
-        # Get current subscription
-        current = await self.get_school_current_subscription(session, school_id)
-        
+        # Fetch the raw row (not the Response wrapper) — subscription_outstanding()
+        # needs late_fee_amount/discount_amount, which PlatformSubscriptionResponse
+        # doesn't carry.
+        result = await session.execute(
+            select(PlatformSubscription)
+            .where(PlatformSubscription.school_id == school_id)
+            .order_by(PlatformSubscription.created_at.desc())
+        )
+        current = result.scalars().first()
+
         if not current:
             return None
-        
+
         days_until_due = (current.due_date - datetime.utcnow()).days
-        is_overdue = days_until_due < 0
-        remaining_balance = current.total_amount_due - current.amount_paid
-        
+        # remaining_balance/is_overdue must agree with subscription_outstanding() —
+        # the figure actually used for payment, suspension, and reactivation.
+        # total_amount_due - amount_paid alone ignores late fees and discounts,
+        # so the dashboard could show a different balance than what's collectible.
+        remaining_balance = subscription_outstanding(current)
+        is_overdue = days_until_due < 0 and remaining_balance > 0
+
         return SubscriptionMetrics(
             school_id=school_id,
             current_term_status=current.status,

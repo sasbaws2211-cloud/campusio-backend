@@ -1,6 +1,6 @@
 """Transport Management Models"""
 from sqlmodel import SQLModel, Field
-from sqlalchemy import Column, String, ForeignKey
+from sqlalchemy import Column, String, ForeignKey, UniqueConstraint
 from typing import Optional, List
 from datetime import datetime
 from enum import Enum
@@ -44,10 +44,15 @@ class AttendanceStatus(str, Enum):
 class Vehicle(SQLModel, table=True):
     """Vehicle/Bus model"""
     __tablename__ = "vehicles"
-    
+    __table_args__ = (UniqueConstraint("school_id", "registration_number", name="uq_vehicles_school_registration"),)
+
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
     school_id: str = Field(index=True)
-    registration_number: str = Field(unique=True, index=True)
+    # Registration numbers are only guaranteed unique within a school's own
+    # fleet, not globally -- two different schools (or a shared contractor
+    # serving both) can legitimately record the same plate. See
+    # uq_vehicles_school_registration above.
+    registration_number: str = Field(index=True)
     vehicle_type: VehicleType
     make: str
     model: str
@@ -114,13 +119,16 @@ class VehicleUpdate(SQLModel):
 class Route(SQLModel, table=True):
     """Route model"""
     __tablename__ = "routes"
-    
+    __table_args__ = (UniqueConstraint("school_id", "route_code", name="uq_routes_school_route_code"),)
+
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
     school_id: str = Field(index=True)
     route_name: str = Field(index=True)
     start_point: str
     end_point: str
-    route_code: str = Field(unique=True, index=True)
+    # Route codes are a school's own internal labeling scheme, not a
+    # globally unique identifier -- see uq_routes_school_route_code above.
+    route_code: str = Field(index=True)
     distance_km: float
     estimated_duration_minutes: int
     vehicle_id: Optional[str] = Field(
@@ -139,6 +147,20 @@ class Route(SQLModel, table=True):
     fee_amount: float
     status: RouteStatus = RouteStatus.ACTIVE
     notes: Optional[str] = None
+    # Arrival geofence — optional. When all three are set, a GPS ping within
+    # arrival_geofence_meters of (destination_lat, destination_lng) in
+    # routers/security.py::post_bus_location auto-transitions every student
+    # still EN_ROUTE_BUS on this route to ARRIVED_UNCONFIRMED, instead of
+    # requiring a staff member to notice the bus arrived and tap a bulk/
+    # per-student action. Left unset, a route works exactly as before —
+    # arrival still requires POST /security/transport/{route_id}/arrived.
+    destination_lat: Optional[float] = None
+    destination_lng: Optional[float] = None
+    arrival_geofence_meters: Optional[float] = None
+    # Speed alerting — optional. When set, a GPS ping reporting speed_kmh
+    # above this raises a SecurityIncident + admin SMS (debounced — see
+    # routers/security.py::post_bus_location). Left unset, no alerting.
+    max_speed_kmh: Optional[float] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -157,6 +179,10 @@ class RouteCreate(SQLModel):
     intermediate_stops: Optional[str] = None
     fee_amount: float
     notes: Optional[str] = None
+    destination_lat: Optional[float] = None
+    destination_lng: Optional[float] = None
+    arrival_geofence_meters: Optional[float] = None
+    max_speed_kmh: Optional[float] = None
 
 
 class RouteUpdate(SQLModel):
@@ -174,6 +200,61 @@ class RouteUpdate(SQLModel):
     fee_amount: Optional[float] = None
     status: Optional[RouteStatus] = None
     notes: Optional[str] = None
+    destination_lat: Optional[float] = None
+    destination_lng: Optional[float] = None
+    arrival_geofence_meters: Optional[float] = None
+    max_speed_kmh: Optional[float] = None
+
+
+class RouteStop(SQLModel, table=True):
+    """An ordered, GPS-coordinate-bearing stop on a route — deliberately a
+    SEPARATE table from Route.intermediate_stops (a flat JSON list of stop
+    NAMES, read by existing route CRUD and the frontend as plain strings).
+    Redefining that column's meaning to carry coordinates would be a
+    breaking change to every existing consumer; this is purely additive —
+    a route with no RouteStop rows behaves exactly as it always has.
+    Lets a live GPS ping (routers/security.py::post_bus_location) be turned
+    into a per-stop distance/ETA instead of only a raw lat/lng on a map."""
+    __tablename__ = "route_stops"
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    school_id: str = Field(index=True)
+    route_id: str = Field(sa_column=Column(String, ForeignKey("routes.id", ondelete="CASCADE"), index=True))
+
+    sequence: int  # 1-based order along the route
+    name: str
+    lat: float
+    lng: float
+    # Optional scheduled offset from Route.pickup_time, in minutes — lets a
+    # parent see a scheduled ETA even before a driver has gone live with GPS
+    # today. Purely informational; the live geofence/ETA logic never reads it.
+    eta_offset_minutes: Optional[int] = None
+
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class RouteStopCreate(SQLModel):
+    sequence: int
+    name: str
+    lat: float
+    lng: float
+    eta_offset_minutes: Optional[int] = None
+
+
+class RouteStopUpdate(SQLModel):
+    sequence: Optional[int] = None
+    name: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    eta_offset_minutes: Optional[int] = None
+
+
+class BulkRouteStopsRequest(SQLModel):
+    """Replaces the ENTIRE ordered stop list for a route in one call — the
+    natural shape for a "define this route's stops" admin UI (draw pins on
+    a map, save all at once) rather than one create call per stop."""
+    stops: List[RouteStopCreate]
 
 
 class StudentTransport(SQLModel, table=True):
@@ -326,7 +407,7 @@ class TransportFeeUpdate(SQLModel):
 class VehicleMaintenance(SQLModel, table=True):
     """Vehicle maintenance record"""
     __tablename__ = "vehicle_maintenance"
-    
+
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
     school_id: str = Field(index=True)
     vehicle_id: str = Field(sa_column=Column(String, ForeignKey("vehicles.id", ondelete="CASCADE"), index=True))
@@ -335,8 +416,14 @@ class VehicleMaintenance(SQLModel, table=True):
     maintenance_type: str  # e.g., "Oil Change", "Tire Replacement", "Inspection"
     description: str
     cost: float
+    # Optional links into the general facilities module, so a vehicle
+    # service can be done by a tracked FacilityContractor and/or tied to a
+    # FacilityWorkOrder for shared service-history reporting — this log
+    # stays the source of truth for vehicle service either way.
+    contractor_id: Optional[str] = Field(default=None, index=True)
+    work_order_id: Optional[str] = Field(default=None, index=True)
     notes: Optional[str] = None
-    
+
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -346,18 +433,27 @@ class VehicleMaintenanceCreate(SQLModel):
     maintenance_type: str
     description: str
     cost: float
+    contractor_id: Optional[str] = None
+    work_order_id: Optional[str] = None
     notes: Optional[str] = None
 
 
 class DriverStaff(SQLModel, table=True):
     """Driver and Conductor staff assignment"""
     __tablename__ = "driver_staff"
-    
+    __table_args__ = (UniqueConstraint("school_id", "license_number", name="uq_driver_staff_school_license"),)
+
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
     school_id: str = Field(index=True)
+    # staff_id references Staff.id, already a globally-unique UUID PK --
+    # this unique=True is a correct "one driver profile per Staff row"
+    # guard, not a natural key, so it's left as a plain global constraint.
     staff_id: str = Field(unique=True, index=True)  # References Staff model
-    
-    license_number: str = Field(unique=True, index=True)
+
+    # License numbers can legitimately repeat across schools (a driver
+    # licensed once can drive for more than one school, or a contractor
+    # shares staff across schools) -- see uq_driver_staff_school_license.
+    license_number: str = Field(index=True)
     license_expiry: str
     role: str  # 'driver' or 'conductor'
     

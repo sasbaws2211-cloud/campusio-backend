@@ -223,11 +223,11 @@ Do not share this code with anyone.
             server.login(sender_email, sender_password)
             server.sendmail(sender_email, email, message.as_string())
         
-        print(f"[OTP-EMAIL] ✓ Email sent successfully to {email}")
+        print(f"[OTP-EMAIL] OK: Email sent successfully to {email}")
         return True
-    
+
     except Exception as e:
-        print(f"[OTP-EMAIL] ✗ Error sending OTP email: {str(e)}")
+        print(f"[OTP-EMAIL] FAILED: Error sending OTP email: {str(e)}")
         logger.error(f"OTP email send failed: {str(e)}")
         return False
 
@@ -271,17 +271,17 @@ async def send_otp_sms(phone_number: str, otp_code: str) -> bool:
         
         # Check if SMS was sent successfully
         if result.get("success"):
-            print(f"[OTP-SMS] ✓ SMS sent successfully to {phone_number}")
+            print(f"[OTP-SMS] OK: SMS sent successfully to {phone_number}")
             logger.info(f"OTP SMS sent successfully to {phone_number}")
             return True
         else:
             error = result.get("error", "Unknown error")
-            print(f"[OTP-SMS] ✗ Failed to send SMS: {error}")
+            print(f"[OTP-SMS] FAILED: Failed to send SMS: {error}")
             logger.error(f"Failed to send OTP SMS: {error}")
             return False
-    
+
     except Exception as e:
-        print(f"[OTP-SMS] ✗ Exception: {str(e)}")
+        print(f"[OTP-SMS] FAILED: Exception: {str(e)}")
         logger.error(f"Error sending OTP SMS: {str(e)}")
         return False
 

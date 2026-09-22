@@ -56,6 +56,11 @@ class Timetable(SQLModel, table=True):
     day_of_week: DayOfWeek
     academic_term_id: str = Field(sa_column=Column(String, ForeignKey("academic_terms.id", ondelete="CASCADE"), index=True))
     room: Optional[str] = None
+    # Optional link to a bookable FacilityRoom (models.facilities.FacilityRoom).
+    # Deliberately not a hard DB ForeignKey — FacilityBooking.room_id itself has
+    # none either; validated at the application layer only, same convention.
+    # The free-text `room` field above is untouched historical data.
+    facility_room_id: Optional[str] = Field(default=None, index=True)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -68,3 +73,4 @@ class TimetableCreate(SQLModel):
     day_of_week: DayOfWeek
     academic_term_id: str
     room: Optional[str] = None
+    facility_room_id: Optional[str] = None

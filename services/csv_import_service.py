@@ -2,16 +2,18 @@
 import traceback
 import pandas as pd
 import io
-from typing import List, Dict, Any, Optional 
+from typing import List, Dict, Any, Optional
+from fastapi import HTTPException
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 from datetime import datetime
 import uuid
 
-from models.student import Student, StudentCreate, Gender, StudentStatus
+from models.student import Student, StudentCreate, Gender, StudentStatus, StudentEnrollment
 from models.staff import Staff, StaffCreate, StaffType, StaffStatus
 from models.classroom import Class, ClassLevel
+from models.school import AcademicTerm
 from models.user import User
 
 
@@ -110,6 +112,15 @@ class CSVImportService:
             # Optional columns that may exist
             optional_columns = ['other_names', 'class', 'address', 'nationality', 'religion', 'blood_group', 'medical_conditions', 'photo_url']
 
+            # Resolve once up front so each row doesn't re-query for it;
+            # skipped (no enrollment rows written) if the school has no
+            # current term configured yet, same tolerance as the students router.
+            term_result = await self.session.execute(
+                select(AcademicTerm).where(AcademicTerm.school_id == self.school_id, AcademicTerm.is_current == True)  # noqa: E712
+            )
+            current_term = term_result.scalar_one_or_none()
+            current_term_id = current_term.id if current_term else None
+
             # Process each row
             for index, row in df.iterrows():
                 try:
@@ -130,6 +141,17 @@ class CSVImportService:
                         class_id = await self._get_class_id_by_name(str(row['class']))
                         if not class_id:
                             self.errors.append(f"Row {index + 2}: Class '{row['class']}' not found")
+                            continue
+                        # check_class_capacity is the same capacity guard every
+                        # other student-enrollment path uses (admission
+                        # conversion, rollover, direct create) — without it a
+                        # CSV import can silently over-fill a class past its
+                        # configured capacity.
+                        from routers.students import check_class_capacity  # deferred: avoids import cycle (students.py imports this module)
+                        try:
+                            await check_class_capacity(self.session, self.school_id, class_id)
+                        except HTTPException as exc:
+                            self.errors.append(f"Row {index + 2}: {exc.detail}")
                             continue
 
                     # Create student data
@@ -153,6 +175,15 @@ class CSVImportService:
                     # Create student
                     student = Student(school_id=self.school_id, **student_data.model_dump())
                     self.session.add(student)
+
+                    if class_id and current_term_id:
+                        self.session.add(StudentEnrollment(
+                            school_id=self.school_id,
+                            student_id=student.id,
+                            class_id=class_id,
+                            academic_term_id=current_term_id,
+                        ))
+
                     self.success_count += 1
 
                 except Exception as e:

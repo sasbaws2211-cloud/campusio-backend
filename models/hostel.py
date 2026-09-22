@@ -1,6 +1,6 @@
 """Hostel Management Models"""
 from sqlmodel import SQLModel, Field
-from sqlalchemy import Column, String, ForeignKey
+from sqlalchemy import Column, String, ForeignKey, UniqueConstraint
 from typing import Optional, List
 from datetime import datetime
 from enum import Enum
@@ -51,11 +51,14 @@ class CheckInStatus(str, Enum):
 class Hostel(SQLModel, table=True):
     """Hostel/Dormitory model"""
     __tablename__ = "hostels"
-    
+    __table_args__ = (UniqueConstraint("school_id", "hostel_code", name="uq_hostels_school_hostel_code"),)
+
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
     school_id: str = Field(index=True)
     hostel_name: str = Field(index=True)
-    hostel_code: str = Field(unique=True, index=True)
+    # Hostel codes are a school's own internal labeling scheme, not a
+    # globally unique identifier -- see uq_hostels_school_hostel_code above.
+    hostel_code: str = Field(index=True)
     hostel_type: str  # Boys, Girls, Mixed
     capacity: int
     current_occupancy: int = 0
@@ -411,7 +414,11 @@ class HostelMaintenance(SQLModel, table=True):
     description: str
     cost: float = 0.0
     status: str = "completed"  # pending, completed, cancelled
-    
+    # Optional links into the general facilities module — same reasoning
+    # as VehicleMaintenance.contractor_id/work_order_id in models/transport.py.
+    contractor_id: Optional[str] = Field(default=None, index=True)
+    work_order_id: Optional[str] = Field(default=None, index=True)
+
     notes: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -424,6 +431,42 @@ class HostelMaintenanceCreate(SQLModel):
     description: str
     cost: float = 0.0
     status: str = "completed"
+    contractor_id: Optional[str] = None
+    work_order_id: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class RoomInventoryItem(SQLModel, table=True):
+    """Per-item condition/inventory log for a room (furniture, fixtures,
+    appliances, etc.) — distinct from the boolean amenity flags on Room,
+    which only record whether a facility exists, not its condition."""
+    __tablename__ = "room_inventory_items"
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    school_id: str = Field(index=True)
+    room_id: str = Field(sa_column=Column(String, ForeignKey("rooms.id", ondelete="CASCADE"), index=True))
+    item_name: str
+    condition: str = "good"
+    last_checked_date: str
+    checked_by: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class RoomInventoryItemCreate(SQLModel):
+    item_name: str
+    condition: str = "good"
+    last_checked_date: str
+    checked_by: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class RoomInventoryItemUpdate(SQLModel):
+    item_name: Optional[str] = None
+    condition: Optional[str] = None
+    last_checked_date: Optional[str] = None
+    checked_by: Optional[str] = None
     notes: Optional[str] = None
 
 
@@ -439,11 +482,14 @@ class HostelVisitor(SQLModel, table=True):
     visitor_name: str
     visitor_phone: Optional[str] = None
     relationship: str  # Parent, Guardian, Friend, etc.
-    
+
+    id_type: Optional[str] = None  # e.g. "National ID", "Passport", "Driver's License"
+    id_number: Optional[str] = None
+
     visit_date: str
     check_in_time: Optional[str] = None
     check_out_time: Optional[str] = None
-    
+
     notes: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -454,7 +500,21 @@ class HostelVisitorCreate(SQLModel):
     visitor_name: str
     visitor_phone: Optional[str] = None
     relationship: str
+    id_type: Optional[str] = None
+    id_number: Optional[str] = None
     visit_date: str
+    check_in_time: Optional[str] = None
+    check_out_time: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class HostelVisitorUpdate(SQLModel):
+    visitor_name: Optional[str] = None
+    visitor_phone: Optional[str] = None
+    relationship: Optional[str] = None
+    id_type: Optional[str] = None
+    id_number: Optional[str] = None
+    visit_date: Optional[str] = None
     check_in_time: Optional[str] = None
     check_out_time: Optional[str] = None
     notes: Optional[str] = None

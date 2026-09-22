@@ -1,5 +1,16 @@
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.venv/ 
+alembic/versions/* 
+uploads/
+
+
 # dependencies
 /node_modules
 /.pnp

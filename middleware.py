@@ -36,6 +36,26 @@ rate_limit_storage = defaultdict(list)
 
 
 
+class ConditionalGZipMiddleware(GZipMiddleware):
+    """GZipMiddleware buffers a response's bytes to compress them as one
+    block, which is fine for ordinary JSON/HTML responses but breaks
+    Server-Sent Events: routers/security.py's stream_school_events returns
+    a StreamingResponse that's meant to flush each `data: ...\\n\\n` chunk
+    to the client as soon as it's published, and that never happens if
+    gzip is buffering upstream of it (the "stream" never completes, so
+    gzip's buffer never flushes — the browser sees an open connection with
+    zero bytes delivered, indefinitely). Skip compression entirely for the
+    SSE endpoint; every other route keeps the existing gzip behavior."""
+
+    _EXCLUDED_PATH_PREFIXES = ("/api/security/events/stream",)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"].startswith(self._EXCLUDED_PATH_PREFIXES):
+            await self.app(scope, receive, send)
+        else:
+            await super().__call__(scope, receive, send)
+
+
 def register_middleware(app: FastAPI):
 
     # Allow both localhost and 127.0.0.1 origins for frontend  
@@ -51,7 +71,7 @@ def register_middleware(app: FastAPI):
     
     # ✅ OPTIMIZATION: Add GZIP compression middleware
     # Reduces response size by 60-80% for JSON responses
-    app.add_middleware(GZipMiddleware, minimum_size=1000)
+    app.add_middleware(ConditionalGZipMiddleware, minimum_size=1000)
     
     app.add_middleware(
         CORSMiddleware,

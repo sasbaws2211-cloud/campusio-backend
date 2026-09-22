@@ -27,6 +27,10 @@ class TransactionType(str, Enum):
     """Type of online transaction"""
     FEE = "fee"  # Student fee payment
     SUBSCRIPTION = "subscription"  # Platform subscription payment
+    CANTEEN_TOPUP = "canteen_topup"  # Parent funding a student's canteen wallet
+    EXTRA_CLASS_FEE = "extra_class_fee"  # Parent paying a teacher-led extra class billing cycle
+    ADMISSION_FEE = "admission_fee"  # Public applicant paying an admissions application fee
+    ADMISSION_DEPOSIT = "admission_deposit"  # Public applicant paying a seat-deposit after accepting an offer
 
 
 class OnlineTransaction(SQLModel, table=True):
@@ -40,6 +44,9 @@ class OnlineTransaction(SQLModel, table=True):
     fee_id: str = Field(index=True)
     student_id: str = Field(index=True)
     parent_id: str = Field(index=True)
+    # Set only for transaction_type == EXTRA_CLASS_FEE — which billing
+    # cycle this payment settles.
+    billing_cycle_id: Optional[str] = Field(default=None, index=True)
     
     # Payment details
     amount: float  # Amount requested (GHS)
@@ -80,6 +87,15 @@ class OnlineTransaction(SQLModel, table=True):
     refunded_at: Optional[datetime] = None
     refunded_by: Optional[str] = None  # User.id who marked it refunded
     refund_notes: Optional[str] = None
+    # GL entry recognizing the overpayment as a liability the moment it's
+    # flagged (Dr Bank/Clearing / Cr Refunds Payable) — see
+    # services/fee_gl_service.py::post_refund_liability. Previously this
+    # cash had zero GL representation until/unless someone remembered to
+    # refund it, silently understating GL cash for that whole window.
+    refund_liability_journal_entry_id: Optional[str] = None
+    # GL entry for the refund actually being paid out (Dr Refunds Payable /
+    # Cr Bank/Clearing) — set once mark_fee_refund_completed runs.
+    refund_payout_journal_entry_id: Optional[str] = None
 
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)

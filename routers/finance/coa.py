@@ -24,16 +24,22 @@ from models.finance import (
     AccountCategory,
 )
 from models.finance.gl_audit_log import AuditActionType, AuditEntityType
-from models.user import User, UserRole
+from models.user import User
 from database import get_session
-from auth import get_current_user, require_roles
+from auth import get_current_user, require_permission
 from services.coa_service import CoaService, CoaServiceError
 from services.coa_initialization import validate_school_chart_of_accounts
 from services.gl_audit_log_service import GLAuditLogService
+from services.plan_gating import require_plan_feature
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/chart-of-accounts", tags=["Finance - Chart of Accounts"])
+# Gated at the router level (all endpoints), not per-endpoint like
+# routers/integrations.py — same effect, fewer lines across a file this size.
+router = APIRouter(
+    prefix="/chart-of-accounts", tags=["Finance - Chart of Accounts"],
+    dependencies=[Depends(require_plan_feature("finance_advanced"))],
+)
 
 
 async def _log_gl_audit(
@@ -67,11 +73,7 @@ async def _log_gl_audit(
 @router.post("", response_model=GLAccountResponse, status_code=status.HTTP_201_CREATED)
 async def create_account(
     account_data: GLAccountCreate,
-    current_user: User = Depends(require_roles(
-        UserRole.SUPER_ADMIN,
-        UserRole.SCHOOL_ADMIN,
-        UserRole.HR,
-    )),
+    current_user: User = Depends(require_permission("finance.coa.create")),
     session: AsyncSession = Depends(get_session),
 ):
     """Create a new GL account
@@ -369,10 +371,7 @@ async def get_accounts_by_category(
 async def update_account(
     account_id: str,
     update_data: GLAccountUpdate,
-    current_user: User = Depends(require_roles(
-        UserRole.SUPER_ADMIN,
-        UserRole.SCHOOL_ADMIN,
-    )),
+    current_user: User = Depends(require_permission("finance.coa.update")),
     session: AsyncSession = Depends(get_session),
 ):
     """Update an existing GL account
@@ -433,10 +432,7 @@ async def update_account(
 @router.delete("/{account_id}", response_model=dict)
 async def deactivate_account(
     account_id: str,
-    current_user: User = Depends(require_roles(
-        UserRole.SUPER_ADMIN,
-        UserRole.SCHOOL_ADMIN,
-    )),
+    current_user: User = Depends(require_permission("finance.coa.delete")),
     session: AsyncSession = Depends(get_session),
 ):
     """Deactivate (soft delete) a GL account
@@ -468,7 +464,10 @@ async def deactivate_account(
             detail=f"Account {account_id} not found"
         )
     
-    updated_account = await service.deactivate_account(school_id, account_id)
+    try:
+        updated_account = await service.deactivate_account(school_id, account_id)
+    except CoaServiceError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
     await _log_gl_audit(
         session, school_id, account_id, AuditActionType.ACCOUNT_DEACTIVATED, current_user,
@@ -481,6 +480,81 @@ async def deactivate_account(
         "account_id": account_id,
         "is_active": updated_account.is_active,
     }
+
+
+# ==================== Balance Operations ====================
+
+@router.get("/{account_id}/balance", response_model=dict)
+async def get_account_balance(
+    account_id: str,
+    use_cached: bool = Query(True, description="Use the denormalized balance; False recalculates from journal entries"),
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Get the current balance of a GL account
+
+    **Access:** All authenticated users
+
+    Query parameters:
+    - use_cached: True (default) returns the fast denormalized current_balance;
+      False recalculates it from posted journal entries for verification.
+    """
+    school_id = current_user.school_id
+    if not school_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No school context"
+        )
+
+    service = CoaService(session)
+    account = await service.get_account_by_id(school_id, account_id)
+    if not account:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Account {account_id} not found"
+        )
+
+    balance = await service.get_account_balance(school_id, account_id, use_cached=use_cached)
+
+    return {
+        "account_id": account_id,
+        "account_code": account.account_code,
+        "account_name": account.account_name,
+        "balance": balance,
+        "use_cached": use_cached,
+    }
+
+
+@router.post("/recalculate-balances", response_model=dict)
+async def recalculate_all_balances(
+    current_user: User = Depends(require_permission("finance.coa.manage")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Recalculate every GL account's balance from posted journal entries
+
+    **Access:** SUPER_ADMIN, SCHOOL_ADMIN only
+
+    Heavy operation intended for audit/correction procedures, not routine use —
+    sums all posted journal-entry activity per account and overwrites the
+    denormalized current_balance. Run during low-traffic periods.
+    """
+    school_id = current_user.school_id
+    if not school_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No school context"
+        )
+
+    service = CoaService(session)
+    summary = await service.recalculate_all_balances(school_id)
+
+    if "error" in summary:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=summary["error"],
+        )
+
+    return summary
 
 
 # ==================== Account Analysis & Summary ====================
@@ -516,10 +590,7 @@ async def get_account_summary(
 
 @router.post("/validate", response_model=dict)
 async def validate_accounts(
-    current_user: User = Depends(require_roles(
-        UserRole.SUPER_ADMIN,
-        UserRole.SCHOOL_ADMIN,
-    )),
+    current_user: User = Depends(require_permission("finance.coa.manage")),
     session: AsyncSession = Depends(get_session),
 ):
     """Validate that required GL accounts are configured

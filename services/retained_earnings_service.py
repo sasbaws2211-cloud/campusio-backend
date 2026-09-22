@@ -23,6 +23,7 @@ from models.finance import (
 )
 from models.finance.chart_of_accounts import GLAccount, AccountType, AccountCategory
 from models.finance.fiscal_period import FiscalPeriod, FiscalPeriodStatus
+from models.finance.gl_audit_log import AuditActionType, AuditEntityType
 from services.journal_entry_service import JournalEntryService, JournalEntryError
 from services.coa_service import CoaService
 from services.gl_audit_log_service import GLAuditLogService
@@ -64,20 +65,75 @@ class RetainedEarningsService:
         self.period_service = FiscalPeriodService(session)
     
     # ==================== Closing Procedures ====================
-    
+
+    async def _get_period_account_activity(
+        self,
+        school_id: str,
+        period: FiscalPeriod,
+        account_type: AccountType,
+    ) -> List[Tuple[GLAccount, Decimal, Decimal]]:
+        """Sum posted journal-entry activity for accounts of a type, bounded
+        to a single fiscal period's date range.
+
+        Closing must reflect exactly what happened *in this period* — not
+        whatever the account's running `current_balance` happens to hold,
+        which can include a late/backdated entry from outside the period, or
+        drift if periods are closed out of chronological order. Only POSTED
+        entries dated within [period.start_date, period.end_date] count.
+
+        Returns:
+            List of (account, period_debit_total, period_credit_total) for
+            accounts with any activity in the period (zero-activity accounts
+            are omitted).
+        """
+        result = await self.session.execute(
+            select(
+                GLAccount,
+                func.coalesce(func.sum(JournalLineItem.debit_amount), Decimal("0")).label("period_debit"),
+                func.coalesce(func.sum(JournalLineItem.credit_amount), Decimal("0")).label("period_credit"),
+            )
+            .join(JournalLineItem, JournalLineItem.gl_account_id == GLAccount.id)
+            .join(JournalEntry, JournalEntry.id == JournalLineItem.journal_entry_id)
+            .where(
+                and_(
+                    GLAccount.school_id == school_id,
+                    GLAccount.account_type == account_type,
+                    GLAccount.is_active == True,
+                    # POSTED *and* REVERSED, not POSTED alone: reversing an
+                    # entry flips its own status to REVERSED, so a
+                    # POSTED-only filter would drop the original posting's
+                    # line items while still counting the contra-entry's
+                    # (which stays POSTED) — netting to the reversal amount
+                    # instead of zero. Caught live via budget-vs-actual,
+                    # which shares this exact query shape.
+                    JournalEntry.posting_status.in_([PostingStatus.POSTED, PostingStatus.REVERSED]),
+                    JournalEntry.entry_date >= period.start_date,
+                    JournalEntry.entry_date <= period.end_date,
+                )
+            )
+            .group_by(GLAccount.id)
+        )
+
+        return [
+            (account, period_debit or Decimal("0"), period_credit or Decimal("0"))
+            for account, period_debit, period_credit in result.all()
+        ]
+
     async def calculate_net_income(
         self,
         school_id: str,
         period_id: str,
     ) -> Dict[str, Any]:
         """Calculate net income for a fiscal period
-        
-        Net Income = Revenue - Expenses
-        
+
+        Net Income = Revenue - Expenses, computed from this period's posted
+        activity only (see _get_period_account_activity), not from accounts'
+        cumulative current_balance.
+
         Args:
             school_id: School identifier
             period_id: Fiscal period ID
-            
+
         Returns:
             Dictionary with revenue, expenses, and net income
         """
@@ -86,39 +142,23 @@ class RetainedEarningsService:
             period = await self.period_service.get_period_by_id(school_id, period_id)
             if not period:
                 raise RetainedEarningsError(f"Period {period_id} not found")
-            
-            # Calculate revenue (sum of all revenue accounts)
-            revenue_result = await self.session.execute(
-                select(func.sum(GLAccount.current_balance).label("total")).where(
-                    and_(
-                        GLAccount.school_id == school_id,
-                        GLAccount.account_type == AccountType.REVENUE,
-                        GLAccount.is_active == True,
-                    )
-                )
-            )
-            total_revenue = float(revenue_result.scalar() or 0.0)
-            
-            # Calculate expenses (sum of all expense accounts - they have debit balance)
-            expense_result = await self.session.execute(
-                select(func.sum(GLAccount.current_balance).label("total")).where(
-                    and_(
-                        GLAccount.school_id == school_id,
-                        GLAccount.account_type == AccountType.EXPENSE,
-                        GLAccount.is_active == True,
-                    )
-                )
-            )
-            total_expenses = float(expense_result.scalar() or 0.0)
-            
+
+            # Revenue is credit-normal: period contribution = credits - debits
+            revenue_activity = await self._get_period_account_activity(school_id, period, AccountType.REVENUE)
+            total_revenue = sum(credit - debit for _, debit, credit in revenue_activity)
+
+            # Expense is debit-normal: period contribution = debits - credits
+            expense_activity = await self._get_period_account_activity(school_id, period, AccountType.EXPENSE)
+            total_expenses = sum(debit - credit for _, debit, credit in expense_activity)
+
             # Net income = Revenue - Expenses
-            net_income = total_revenue - abs(total_expenses)
-            
+            net_income = total_revenue - total_expenses
+
             return {
                 "period_id": period_id,
                 "period_name": period.period_name,
                 "total_revenue": total_revenue,
-                "total_expenses": abs(total_expenses),
+                "total_expenses": total_expenses,
                 "net_income": net_income,
                 "is_profit": net_income >= 0,
             }
@@ -135,6 +175,7 @@ class RetainedEarningsService:
         closed_by: str,
         ip_address: Optional[str] = None,
         user_role: str = "finance",
+        user_name: str = "Unknown",
     ) -> Dict[str, Any]:
         """Close a fiscal period and create closing entries
         
@@ -168,87 +209,71 @@ class RetainedEarningsService:
             # Calculate net income
             net_income_data = await self.calculate_net_income(school_id, period_id)
             net_income = net_income_data["net_income"]
-            
-            # Get revenue accounts (to close with credit balance)
-            revenue_result = await self.session.execute(
-                select(GLAccount).where(
-                    and_(
-                        GLAccount.school_id == school_id,
-                        GLAccount.account_type == AccountType.REVENUE,
-                        GLAccount.is_active == True,
-                        GLAccount.current_balance != 0,
-                    )
-                )
+
+            # Get revenue/expense accounts with activity *in this period* (not
+            # accounts' cumulative current_balance — see _get_period_account_activity)
+            revenue_activity = await self._get_period_account_activity(school_id, period, AccountType.REVENUE)
+            revenue_activity = [(acct, debit, credit) for acct, debit, credit in revenue_activity if abs(credit - debit) >= Decimal("0.01")]
+
+            expense_activity = await self._get_period_account_activity(school_id, period, AccountType.EXPENSE)
+            expense_activity = [(acct, debit, credit) for acct, debit, credit in expense_activity if abs(debit - credit) >= Decimal("0.01")]
+
+            # Get retained earnings account — looked up by system_role so a
+            # school can rename/replace account 3100 without breaking period
+            # close (falls back to "3100" for schools seeded before
+            # system_role existed).
+            retained_earnings_account = await self.coa_service.get_system_account(
+                school_id=school_id,
+                system_role="retained_earnings",
+                fallback_code="3100",
             )
-            revenue_accounts = revenue_result.scalars().all()
-            
-            # Get expense accounts (to close with debit balance)
-            expense_result = await self.session.execute(
-                select(GLAccount).where(
-                    and_(
-                        GLAccount.school_id == school_id,
-                        GLAccount.account_type == AccountType.EXPENSE,
-                        GLAccount.is_active == True,
-                        GLAccount.current_balance != 0,
-                    )
-                )
-            )
-            expense_accounts = expense_result.scalars().all()
-            
-            # Get retained earnings account (usually in equity)
-            retained_earnings_result = await self.session.execute(
-                select(GLAccount).where(
-                    and_(
-                        GLAccount.school_id == school_id,
-                        GLAccount.account_code == "3100",  # Standard retained earnings code
-                        GLAccount.is_active == True,
-                    )
-                )
-            )
-            retained_earnings_account = retained_earnings_result.scalar_one_or_none()
-            
+
             if not retained_earnings_account:
                 raise RetainedEarningsError(
-                    "Retained Earnings account (3100) not found. Please create it first."
+                    "No retained earnings account configured (expected a GL account "
+                    "with system_role='retained_earnings' or account code 3100). "
+                    "Please create it first."
                 )
             
             # Create closing entry journal lines
             closing_lines = []
-            
-            # Close revenue accounts (credit them with their balance)
-            for revenue_account in revenue_accounts:
-                # Revenue has credit balance, so we debit it to close
+
+            # Close revenue accounts (credit-normal): debit them by this
+            # period's net credit activity to zero out that contribution.
+            # Amounts stay Decimal throughout — no float() round-trip right
+            # before these get compared for balance.
+            for revenue_account, period_debit, period_credit in revenue_activity:
                 closing_lines.append(
                     JournalLineItemCreate(
                         gl_account_id=revenue_account.id,
-                        debit_amount=float(revenue_account.current_balance),  # Zero it out
-                        credit_amount=0.0,
+                        debit_amount=period_credit - period_debit,
+                        credit_amount=Decimal("0"),
                         description=f"Closing: {revenue_account.account_name}",
                         line_number=len(closing_lines) + 1,
                     )
                 )
-            
-            # Close expense accounts (debit them with their balance)
-            for expense_account in expense_accounts:
-                # Expense has debit balance, so we credit it to close
+
+            # Close expense accounts (debit-normal): credit them by this
+            # period's net debit activity to zero out that contribution.
+            for expense_account, period_debit, period_credit in expense_activity:
                 closing_lines.append(
                     JournalLineItemCreate(
                         gl_account_id=expense_account.id,
-                        debit_amount=0.0,
-                        credit_amount=float(abs(expense_account.current_balance)),  # Zero it out
+                        debit_amount=Decimal("0"),
+                        credit_amount=period_debit - period_credit,
                         description=f"Closing: {expense_account.account_name}",
                         line_number=len(closing_lines) + 1,
                     )
                 )
-            
+
             # Post net income to retained earnings
             if net_income > 0:
                 # Profit: credit retained earnings
                 closing_lines.append(
                     JournalLineItemCreate(
                         gl_account_id=retained_earnings_account.id,
-                        debit_amount=0.0,
-                        credit_amount=float(net_income),
+                        debit_amount=Decimal("0"),
+                        credit_amount=net_income,
                         description=f"Net Income for {period.period_name}",
                         line_number=len(closing_lines) + 1,
                     )
@@ -258,8 +283,8 @@ class RetainedEarningsService:
                 closing_lines.append(
                     JournalLineItemCreate(
                         gl_account_id=retained_earnings_account.id,
-                        debit_amount=float(abs(net_income)),
-                        credit_amount=0.0,
+                        debit_amount=abs(net_income),
+                        credit_amount=Decimal("0"),
                         description=f"Net Loss for {period.period_name}",
                         line_number=len(closing_lines) + 1,
                     )
@@ -273,6 +298,10 @@ class RetainedEarningsService:
                 description=f"Period Close - {period.period_name}",
                 line_items=closing_lines,
                 notes=f"Auto-closing entry. Net income: {net_income:.2f}",
+                # Must be able to post into the LOCKED period it's closing —
+                # only adjusting entries are allowed past that lock (see
+                # FiscalPeriodService.can_post_to_period).
+                is_adjusting_entry=True,
             )
             
             # Create and post closing entry
@@ -297,22 +326,75 @@ class RetainedEarningsService:
             period.closed_by = closed_by
             self.session.add(period)
             await self.session.commit()
-            
+
+            try:
+                await self.audit_service.log_action(
+                    school_id=school_id,
+                    entity_type=AuditEntityType.FISCAL_PERIOD,
+                    entity_id=period_id,
+                    action=AuditActionType.PERIOD_CLOSED,
+                    user_id=closed_by,
+                    user_name=user_name,
+                    user_role=user_role,
+                    new_values={
+                        "net_income": net_income,
+                        "closing_entry_id": closing_entry.id,
+                        "revenue_accounts_closed": len(revenue_activity),
+                        "expense_accounts_closed": len(expense_activity),
+                    },
+                    ip_address=ip_address,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to write GL audit log for period close {period_id}: {e}")
+
             logger.info(
                 f"Closed period {period.period_name} (net income: {net_income:.2f}, "
                 f"closing entry: {closing_entry.id})"
             )
-            
+
+            # Auto-carry-forward opening balances into whatever period
+            # immediately follows this one, so schools don't have to
+            # remember set_opening_balances_for_period as a separate manual
+            # step. Best-effort: a missing next period (not created yet) is
+            # the normal case for the last period a school has set up, not
+            # an error — the close itself has already succeeded and committed.
+            opening_balances_result = None
+            next_period_result = await self.session.execute(
+                select(FiscalPeriod).where(
+                    and_(
+                        FiscalPeriod.school_id == school_id,
+                        FiscalPeriod.start_date > period.end_date,
+                    )
+                ).order_by(FiscalPeriod.start_date.asc())
+            )
+            next_period = next_period_result.scalars().first()
+            if next_period:
+                try:
+                    opening_balances_result = await self.set_opening_balances_for_period(
+                        school_id=school_id,
+                        from_period_id=period_id,
+                        to_period_id=next_period.id,
+                        created_by="SYSTEM",
+                        user_role=user_role,
+                        user_name="System (auto-carryforward on period close)",
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Period {period_id} closed but auto opening-balance carryforward "
+                        f"to {next_period.id} failed (can still be run manually): {e}"
+                    )
+
             return {
                 "status": "success",
                 "period_id": period_id,
                 "period_name": period.period_name,
                 "net_income": net_income,
                 "closing_entry_id": closing_entry.id,
-                "revenue_accounts_closed": len(revenue_accounts),
-                "expense_accounts_closed": len(expense_accounts),
+                "revenue_accounts_closed": len(revenue_activity),
+                "expense_accounts_closed": len(expense_activity),
+                "opening_balances_carried_forward": opening_balances_result,
             }
-            
+
         except RetainedEarningsError:
             await self.session.rollback()
             raise
@@ -329,6 +411,9 @@ class RetainedEarningsService:
         from_period_id: str,
         to_period_id: str,
         created_by: str,
+        ip_address: Optional[str] = None,
+        user_role: str = "finance",
+        user_name: str = "Unknown",
     ) -> Dict[str, Any]:
         """Set opening balances for next period from previous period close
         
@@ -373,11 +458,26 @@ class RetainedEarningsService:
                     opening_balance=account.current_balance,
                 )
             
+            try:
+                await self.audit_service.log_action(
+                    school_id=school_id,
+                    entity_type=AuditEntityType.FISCAL_PERIOD,
+                    entity_id=to_period_id,
+                    action=AuditActionType.OPENING_BALANCE_IMPORTED,
+                    user_id=created_by,
+                    user_name=user_name,
+                    user_role=user_role,
+                    new_values={"from_period_id": from_period_id, "accounts_updated": len(bs_accounts)},
+                    ip_address=ip_address,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to write GL audit log for opening balances {to_period_id}: {e}")
+
             logger.info(
                 f"Set opening balances for {len(bs_accounts)} balance sheet accounts "
                 f"for period {to_period.period_name}"
             )
-            
+
             return {
                 "period_id": to_period_id,
                 "accounts_updated": len(bs_accounts),
@@ -427,25 +527,25 @@ class RetainedEarningsService:
             )
             accounts = result.scalars().all()
             
-            total_debits = 0.0
-            total_credits = 0.0
+            total_debits = Decimal("0")
+            total_credits = Decimal("0")
             by_type = {}
-            
+
             for account in accounts:
                 account_type = account.account_type.value
                 if account_type not in by_type:
                     by_type[account_type] = {
                         "accounts": [],
-                        "debit": 0.0,
-                        "credit": 0.0,
+                        "debit": Decimal("0"),
+                        "credit": Decimal("0"),
                     }
-                
+
                 if account.current_balance > 0:
                     debit = account.current_balance
-                    credit = 0.0
+                    credit = Decimal("0")
                     total_debits += debit
                 else:
-                    debit = 0.0
+                    debit = Decimal("0")
                     credit = abs(account.current_balance)
                     total_credits += credit
                 
@@ -459,7 +559,7 @@ class RetainedEarningsService:
                 by_type[account_type]["credit"] += credit
             
             # Verify trial balance is balanced
-            balanced = abs(total_debits - total_credits) < 0.01
+            balanced = abs(total_debits - total_credits) < Decimal("0.01")
             
             return {
                 "period_id": period_id,
@@ -558,16 +658,11 @@ class RetainedEarningsService:
             Retained earnings balance
         """
         try:
-            result = await self.session.execute(
-                select(GLAccount).where(
-                    and_(
-                        GLAccount.school_id == school_id,
-                        GLAccount.account_code == "3100",
-                        GLAccount.is_active == True,
-                    )
-                )
+            account = await self.coa_service.get_system_account(
+                school_id=school_id,
+                system_role="retained_earnings",
+                fallback_code="3100",
             )
-            account = result.scalar_one_or_none()
             return float(account.current_balance) if account else 0.0
         except Exception as e:
             logger.error(f"Error getting retained earnings balance: {str(e)}")

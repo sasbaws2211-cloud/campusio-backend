@@ -41,38 +41,31 @@ class SMSService:
             Response with message IDs and status
         """
         if not self.token:
-            print("[SMS-SERVICE] ERROR: USMS token not configured")
             logger.warning("USMS token not configured - SMS not sent")
             return {"success": False, "error": "SMS service not configured"}
-        
+
         if not phone_numbers:
-            print("[SMS-SERVICE] ERROR: No phone numbers provided")
+            logger.warning("send_sms called with no phone numbers")
             return {"success": False, "error": "No phone numbers provided"}
-        
+
         # Validate message length
         if len(message) > 160 and message_type == "plain":
-            print(f"[SMS-SERVICE] WARNING: Message exceeds 160 chars: {len(message)}")
             logger.warning(f"Message exceeds 160 chars: {len(message)}")
-        
+
         try:
             # Format phone numbers with country code and create comma-separated string per USMS API spec
             formatted_phones = [self.format_phone_number(phone) for phone in phone_numbers]
             recipient = ",".join(formatted_phones)
-            
-            print(f"[SMS-SERVICE] Formatted phones: {formatted_phones}")
-            print(f"[SMS-SERVICE] Recipient: {recipient}")
-            print(f"[SMS-SERVICE] Message: {message}")
-            
+
             payload = {
                 "recipient": recipient,
                 "message": message,
                 "sender_id": self.sender_id,
                 "type": "plain"
             }
-            
-            print(f"[SMS-SERVICE] Payload: {payload}")
-            print(f"[SMS-SERVICE] Calling USMS API at {self.base_url}/api/sms/send")
-            
+
+            logger.debug(f"Calling USMS API at {self.base_url}/api/sms/send for {len(formatted_phones)} recipient(s)")
+
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     f"{self.base_url}/api/sms/send",
@@ -80,13 +73,11 @@ class SMSService:
                     headers=self._get_headers(),
                     timeout=30.0
                 )
-                
-                print(f"[SMS-SERVICE] Response status: {response.status_code}")
-                print(f"[SMS-SERVICE] Response: {response.text}")
-                
+
+                logger.debug(f"USMS response {response.status_code}: {response.text}")
+
                 if response.status_code in [200, 201]:
                     data = response.json()
-                    print(f"[SMS-SERVICE] ✓ SMS sent successfully to {len(formatted_phones)} recipient(s)")
                     logger.info(f"SMS sent successfully to {len(formatted_phones)} recipient(s): {formatted_phones}")
                     return {
                         "success": True,
@@ -96,16 +87,14 @@ class SMSService:
                     }
                 else:
                     error_msg = response.text
-                    print(f"[SMS-SERVICE] ✗ Failed to send SMS: {error_msg}")
                     logger.error(f"Failed to send SMS: {error_msg}")
                     return {
                         "success": False,
                         "error": error_msg,
                         "status_code": response.status_code
                     }
-                    
+
         except Exception as e:
-            print(f"[SMS-SERVICE] ✗ Exception: {str(e)}")
             logger.error(f"Error sending SMS: {str(e)}")
             return {"success": False, "error": str(e)}
     

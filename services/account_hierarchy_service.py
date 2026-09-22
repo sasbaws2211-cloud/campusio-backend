@@ -18,7 +18,6 @@ from models.finance.account_hierarchy import (
     AccountHierarchyType,
     HierarchyNode,
     HierarchyLevel,
-    HierarchyRelationship,
     HierarchyRollup,
     HierarchyConsolidation,
 )
@@ -136,10 +135,12 @@ class AccountHierarchyService:
             AccountHierarchyError: If node creation fails
         """
         try:
-            # Validate hierarchy exists
+            # Validate hierarchy exists — school_id scoped, so a caller can't
+            # attach a node to another school's hierarchy by passing its id.
             hierarchy_result = await self.session.execute(
                 select(AccountHierarchy).where(
-                    AccountHierarchy.id == hierarchy_id
+                    AccountHierarchy.id == hierarchy_id,
+                    AccountHierarchy.school_id == school_id,
                 )
             )
             if not hierarchy_result.scalar_one_or_none():
@@ -158,7 +159,8 @@ class AccountHierarchyService:
             if parent_node_id:
                 parent_result = await self.session.execute(
                     select(HierarchyNode).where(
-                        HierarchyNode.id == parent_node_id
+                        HierarchyNode.id == parent_node_id,
+                        HierarchyNode.school_id == school_id,
                     )
                 )
                 parent = parent_result.scalar_one_or_none()
@@ -199,125 +201,6 @@ class AccountHierarchyService:
             logger.error(f"Error creating hierarchy node: {str(e)}")
             raise AccountHierarchyError(f"Failed to create hierarchy node: {str(e)}")
     
-    # ==================== Relationship Management ====================
-    
-    async def add_hierarchy_relationship(
-        self,
-        school_id: str,
-        hierarchy_id: str,
-        parent_node_id: str,
-        child_node_id: str,
-        child_sequence: int = 0,
-        contribution_percentage: float = 100.0,
-    ) -> str:
-        """Add parent-child relationship in hierarchy
-        
-        Args:
-            school_id: School identifier
-            hierarchy_id: Hierarchy ID
-            parent_node_id: Parent node ID
-            child_node_id: Child node ID
-            child_sequence: Order within parent
-            contribution_percentage: % of child that rolls up (default 100%)
-            
-        Returns:
-            Relationship ID
-            
-        Raises:
-            AccountHierarchyError: If relationship invalid
-        """
-        try:
-            # Validate both nodes exist
-            parent_result = await self.session.execute(
-                select(HierarchyNode).where(HierarchyNode.id == parent_node_id)
-            )
-            parent = parent_result.scalar_one_or_none()
-            if not parent:
-                raise AccountHierarchyError(f"Parent node {parent_node_id} not found")
-            
-            child_result = await self.session.execute(
-                select(HierarchyNode).where(HierarchyNode.id == child_node_id)
-            )
-            child = child_result.scalar_one_or_none()
-            if not child:
-                raise AccountHierarchyError(f"Child node {child_node_id} not found")
-            
-            # Check for circular reference
-            if await self._would_create_cycle(parent_node_id, child_node_id):
-                raise AccountHierarchyError(
-                    "Relationship would create circular reference in hierarchy"
-                )
-            
-            # Create relationship
-            relationship = HierarchyRelationship(
-                school_id=school_id,
-                hierarchy_id=hierarchy_id,
-                parent_node_id=parent_node_id,
-                child_node_id=child_node_id,
-                child_sequence=child_sequence,
-                contribution_percentage=contribution_percentage,
-            )
-            
-            self.session.add(relationship)
-            
-            # Update parent node metadata
-            parent.is_parent = True
-            parent.children_count = (parent.children_count or 0) + 1
-            self.session.add(parent)
-            
-            await self.session.commit()
-            
-            return relationship.id
-            
-        except AccountHierarchyError:
-            await self.session.rollback()
-            raise
-        except Exception as e:
-            await self.session.rollback()
-            logger.error(f"Error adding relationship: {str(e)}")
-            raise AccountHierarchyError(f"Failed to add relationship: {str(e)}")
-    
-    async def _would_create_cycle(
-        self,
-        parent_id: str,
-        child_id: str,
-    ) -> bool:
-        """Check if adding parent->child relationship would create cycle
-        
-        Args:
-            parent_id: Proposed parent node ID
-            child_id: Proposed child node ID
-            
-        Returns:
-            True if would create cycle
-        """
-        try:
-            # Traverse up from parent - if we reach child, cycle exists
-            visited = set()
-            current = parent_id
-            
-            while current:
-                if current == child_id:
-                    return True  # Would create cycle
-                
-                if current in visited:
-                    break  # Visited node, no more traversal needed
-                
-                visited.add(current)
-                
-                # Get parent of current node
-                result = await self.session.execute(
-                    select(HierarchyNode).where(HierarchyNode.id == current)
-                )
-                node = result.scalar_one_or_none()
-                current = node.parent_node_id if node else None
-            
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error checking for cycle: {str(e)}")
-            return False
-    
     # ==================== Balance Rollup ====================
     
     async def calculate_node_balance(
@@ -338,40 +221,41 @@ class AccountHierarchyService:
             Calculated balance
         """
         try:
-            # Get node
+            # Get node — school_id scoped
             node_result = await self.session.execute(
-                select(HierarchyNode).where(HierarchyNode.id == node_id)
+                select(HierarchyNode).where(HierarchyNode.id == node_id, HierarchyNode.school_id == school_id)
             )
             node = node_result.scalar_one_or_none()
             if not node:
                 raise AccountHierarchyError(f"Node {node_id} not found")
-            
-            # If detail node, get GL account balance
+
+            # If detail node, get GL account balance (current_balance is
+            # Decimal; this hierarchy subsystem's own fields are still float)
             if node.level == HierarchyLevel.DETAIL and node.gl_account_id:
                 gl_account = await self.coa_service.get_account_by_id(
                     school_id,
                     node.gl_account_id
                 )
-                return gl_account.current_balance if gl_account else 0.0
-            
+                return float(gl_account.current_balance) if gl_account else 0.0
+
             # If summary node, get all descendant detail balances
             if node.is_parent:
                 total_balance = 0.0
-                descendants = await self._get_all_descendants(node_id)
-                
+                descendants = await self._get_all_descendants(school_id, node_id)
+
                 for descendant_id in descendants:
                     desc_result = await self.session.execute(
-                        select(HierarchyNode).where(HierarchyNode.id == descendant_id)
+                        select(HierarchyNode).where(HierarchyNode.id == descendant_id, HierarchyNode.school_id == school_id)
                     )
                     descendant = desc_result.scalar_one_or_none()
-                    
+
                     if descendant and descendant.level == HierarchyLevel.DETAIL and descendant.gl_account_id:
                         gl_account = await self.coa_service.get_account_by_id(
                             school_id,
                             descendant.gl_account_id
                         )
                         if gl_account:
-                            total_balance += gl_account.current_balance
+                            total_balance += float(gl_account.current_balance)
                 
                 return total_balance
             
@@ -383,30 +267,32 @@ class AccountHierarchyService:
     
     async def _get_all_descendants(
         self,
+        school_id: str,
         node_id: str,
     ) -> List[str]:
         """Get all descendant node IDs (recursive)
-        
+
         Args:
+            school_id: School identifier — scopes traversal to this tenant's own nodes
             node_id: Parent node ID
-            
+
         Returns:
             List of all descendant IDs
         """
         descendants = []
-        
+
         # Get direct children
         child_result = await self.session.execute(
-            select(HierarchyNode).where(HierarchyNode.parent_node_id == node_id)
+            select(HierarchyNode).where(HierarchyNode.parent_node_id == node_id, HierarchyNode.school_id == school_id)
         )
         children = child_result.scalars().all()
-        
+
         for child in children:
             descendants.append(child.id)
             # Recursively get grandchildren
-            grandchildren = await self._get_all_descendants(child.id)
+            grandchildren = await self._get_all_descendants(school_id, child.id)
             descendants.extend(grandchildren)
-        
+
         return descendants
     
     async def rollup_all_nodes(
@@ -424,14 +310,15 @@ class AccountHierarchyService:
             Dictionary mapping node_id to calculated balance
         """
         try:
-            # Get all nodes in hierarchy
+            # Get all nodes in hierarchy — school_id scoped
             result = await self.session.execute(
                 select(HierarchyNode).where(
-                    HierarchyNode.hierarchy_id == hierarchy_id
+                    HierarchyNode.hierarchy_id == hierarchy_id,
+                    HierarchyNode.school_id == school_id,
                 )
             )
             nodes = result.scalars().all()
-            
+
             rollup_data = {}
             
             for node in nodes:
@@ -473,12 +360,13 @@ class AccountHierarchyService:
             Tree structure with balances
         """
         try:
-            # Get root node if not specified
+            # Get root node if not specified — school_id scoped
             if not root_node_id:
                 result = await self.session.execute(
                     select(HierarchyNode).where(
                         and_(
                             HierarchyNode.hierarchy_id == hierarchy_id,
+                            HierarchyNode.school_id == school_id,
                             HierarchyNode.parent_node_id == None
                         )
                     )
@@ -487,9 +375,9 @@ class AccountHierarchyService:
                 if not root:
                     raise AccountHierarchyError("No root node found for hierarchy")
                 root_node_id = root.id
-            
+
             # Build tree recursively
-            tree = await self._build_tree_node(root_node_id)
+            tree = await self._build_tree_node(school_id, root_node_id)
             return tree
             
         except AccountHierarchyError:
@@ -500,31 +388,35 @@ class AccountHierarchyService:
     
     async def _build_tree_node(
         self,
+        school_id: str,
         node_id: str,
     ) -> Dict[str, Any]:
         """Build tree structure for a node (recursive)
-        
+
         Args:
+            school_id: School identifier — scopes this and all recursive
+                calls to the caller's own tenant, so a root_node_id passed
+                by the caller can't be used to read another school's tree.
             node_id: Node ID
-            
+
         Returns:
             Tree structure
         """
         node_result = await self.session.execute(
-            select(HierarchyNode).where(HierarchyNode.id == node_id)
+            select(HierarchyNode).where(HierarchyNode.id == node_id, HierarchyNode.school_id == school_id)
         )
         node = node_result.scalar_one_or_none()
-        
+
         if not node:
             return {}
-        
+
         # Get children
         children_result = await self.session.execute(
-            select(HierarchyNode).where(HierarchyNode.parent_node_id == node_id)
+            select(HierarchyNode).where(HierarchyNode.parent_node_id == node_id, HierarchyNode.school_id == school_id)
             .order_by(HierarchyNode.sequence)
         )
         children = children_result.scalars().all()
-        
+
         # Build tree
         tree_node = {
             "id": node.id,
@@ -534,11 +426,11 @@ class AccountHierarchyService:
             "balance": node.current_balance,
             "children": []
         }
-        
+
         for child in children:
-            child_tree = await self._build_tree_node(child.id)
+            child_tree = await self._build_tree_node(school_id, child.id)
             tree_node["children"].append(child_tree)
-        
+
         return tree_node
     
     # ==================== Consolidated Reporting ====================
@@ -561,18 +453,22 @@ class AccountHierarchyService:
             # Rollup all nodes first
             await self.rollup_all_nodes(school_id, hierarchy_id)
             
-            # Get hierarchy info
+            # Get hierarchy info — school_id scoped
             h_result = await self.session.execute(
                 select(AccountHierarchy).where(
-                    AccountHierarchy.id == hierarchy_id
+                    AccountHierarchy.id == hierarchy_id,
+                    AccountHierarchy.school_id == school_id,
                 )
             )
             hierarchy = h_result.scalar_one_or_none()
-            
+            if not hierarchy:
+                raise AccountHierarchyError(f"Hierarchy {hierarchy_id} not found")
+
             # Group nodes by level
             by_level_result = await self.session.execute(
                 select(HierarchyNode).where(
-                    HierarchyNode.hierarchy_id == hierarchy_id
+                    HierarchyNode.hierarchy_id == hierarchy_id,
+                    HierarchyNode.school_id == school_id,
                 ).order_by(HierarchyNode.level, HierarchyNode.sequence)
             )
             nodes = by_level_result.scalars().all()

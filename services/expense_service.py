@@ -3,10 +3,12 @@
 Handles expense CRUD, approval workflow, and GL posting with GL account balance updates.
 """
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
+from decimal import Decimal
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select, and_
 from datetime import datetime
+from fastapi import BackgroundTasks
 
 from models.finance import (
     Expense,
@@ -18,6 +20,9 @@ from models.finance import (
     ReferenceType,
 )
 from models.finance.chart_of_accounts import GLAccount
+from models.school import School
+from services.coa_service import CoaService
+from services.exchange_rate_service import ExchangeRateService
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +39,30 @@ class ExpenseValidationError(ExpenseError):
 
 class ExpenseService:
     """Service for managing school expenses"""
-    
+
     def __init__(self, session: AsyncSession):
         self.session = session
-    
+
+    async def requires_maker_checker(self, school_id: str) -> bool:
+        """Whether this school has segregation-of-duties enabled
+
+        Off by default (School.require_maker_checker) — small schools with a
+        single finance staffer can't otherwise use the approval workflow.
+        """
+        result = await self.session.execute(
+            select(School.require_maker_checker).where(School.id == school_id)
+        )
+        return bool(result.scalar_one_or_none())
+
+    async def _enforces_budget_limits(self, school_id: str) -> bool:
+        """Whether this school hard-blocks an expense approval that would
+        exceed its budgeted amount for that account/period, vs. only
+        surfacing it as a warning. Off by default (School.enforce_budget_limits)."""
+        result = await self.session.execute(
+            select(School.enforce_budget_limits).where(School.id == school_id)
+        )
+        return bool(result.scalar_one_or_none())
+
     async def create_expense(
         self,
         school_id: str,
@@ -79,13 +104,26 @@ class ExpenseService:
                 gl_account_code = gl_account.account_code
             else:
                 gl_account_code = expense_data.gl_account_code
-            
+
+            vendor_name = expense_data.vendor_name
+            vendor_id = getattr(expense_data, "vendor_id", None)
+            if vendor_id:
+                from models.finance.expenses import Vendor
+                vendor_result = await self.session.execute(
+                    select(Vendor).where(Vendor.id == vendor_id, Vendor.school_id == school_id, Vendor.is_active == True)  # noqa: E712
+                )
+                vendor = vendor_result.scalar_one_or_none()
+                if not vendor:
+                    raise ExpenseValidationError(f"Vendor {vendor_id} not found or inactive")
+                vendor_name = vendor_name or vendor.name
+
             # Create expense
             expense = Expense(
                 school_id=school_id,
                 category=expense_data.category,
                 description=expense_data.description,
-                vendor_name=expense_data.vendor_name,
+                vendor_name=vendor_name,
+                vendor_id=vendor_id,
                 amount=expense_data.amount,
                 currency=expense_data.currency,
                 gl_account_id=expense_data.gl_account_id,
@@ -273,7 +311,54 @@ class ExpenseService:
             await self.session.rollback()
             logger.error(f"Error updating expense: {str(e)}")
             raise ExpenseError(f"Error updating expense: {str(e)}")
-    
+
+    async def attach_receipt(
+        self,
+        school_id: str,
+        expense_id: str,
+        receipt_url: str,
+    ) -> Dict[str, Any]:
+        """Attach a receipt/invoice file URL to an expense
+
+        Args:
+            school_id: School identifier
+            expense_id: Expense to attach the receipt to
+            receipt_url: URL of the already-saved receipt file
+
+        Returns:
+            Updated expense dictionary
+
+        Raises:
+            ExpenseError: If expense not found
+        """
+        try:
+            result = await self.session.execute(
+                select(Expense).where(
+                    and_(
+                        Expense.id == expense_id,
+                        Expense.school_id == school_id
+                    )
+                )
+            )
+            expense = result.scalar_one_or_none()
+
+            if not expense:
+                raise ExpenseError(f"Expense {expense_id} not found")
+
+            expense.receipt_url = receipt_url
+            expense.updated_at = datetime.utcnow()
+            self.session.add(expense)
+            await self.session.commit()
+
+            return await self._expense_to_dict(expense)
+        except ExpenseError:
+            await self.session.rollback()
+            raise
+        except Exception as e:
+            await self.session.rollback()
+            logger.error(f"Error attaching receipt: {str(e)}")
+            raise ExpenseError(f"Error attaching receipt: {str(e)}")
+
     async def submit_expense(
         self,
         school_id: str,
@@ -335,6 +420,7 @@ class ExpenseService:
         approval_notes: Optional[str] = None,
         ip_address: Optional[str] = None,
         user_role: str = "finance",
+        background_tasks: Optional[BackgroundTasks] = None,
     ) -> Dict[str, Any]:
         """Approve expense and create GL posting (PENDING → APPROVED)
         
@@ -370,7 +456,34 @@ class ExpenseService:
                 raise ExpenseError(
                     f"Cannot approve expense in {expense.status} status (only PENDING can be approved)"
                 )
-            
+
+            if await self.requires_maker_checker(school_id) and expense.submitted_by == approved_by:
+                raise ExpenseError(
+                    "Segregation of duties: you submitted this expense and cannot also approve it"
+                )
+
+            # Budget check — previously "budget" was purely an after-the-fact
+            # report (BudgetService.get_budget_vs_actual); nothing in this
+            # approval path ever consulted it, so a school could blow
+            # through an approved budget with zero warning anywhere. Only
+            # HARD-blocks when the school has opted into
+            # School.enforce_budget_limits; otherwise this is surfaced as a
+            # warning on the response, never silently ignored.
+            budget_warning = None
+            if expense.gl_account_id:
+                from services.budget_service import BudgetService
+                budget_check = await BudgetService(self.session).check_budget_available(
+                    school_id, expense.gl_account_id, expense.expense_date, expense.amount,
+                )
+                if budget_check and budget_check["exceeds_budget"]:
+                    if await self._enforces_budget_limits(school_id):
+                        raise ExpenseError(
+                            f"Approving this expense would exceed the budgeted amount for account "
+                            f"{budget_check['account_code']} by {budget_check['exceeds_by']:.2f} "
+                            f"(budgeted {budget_check['budgeted_amount']:.2f}, would reach {budget_check['projected_after']:.2f})"
+                        )
+                    budget_warning = budget_check
+
             expense.status = ExpenseStatus.APPROVED
             expense.approved_by = approved_by
             expense.approved_date = datetime.utcnow()
@@ -380,9 +493,27 @@ class ExpenseService:
             
             self.session.add(expense)
             await self.session.commit()
-            
+
             logger.info(f"Approved expense {expense_id} (amount: {expense.amount})")
-            return await self._expense_to_dict(expense)
+
+            if background_tasks is not None:
+                from services.webhook_service import emit_event
+                await emit_event(
+                    self.session, background_tasks, school_id, "expense.approved",
+                    {
+                        "id": expense.id,
+                        "category": expense.category,
+                        "amount": float(expense.amount),
+                        "approved_by": approved_by,
+                    },
+                )
+
+            result_dict = await self._expense_to_dict(expense)
+            if budget_warning:
+                result_dict["budget_warning"] = {
+                    k: (float(v) if isinstance(v, Decimal) else v) for k, v in budget_warning.items()
+                }
+            return result_dict
         except ExpenseError:
             await self.session.rollback()
             raise
@@ -390,7 +521,7 @@ class ExpenseService:
             await self.session.rollback()
             logger.error(f"Error approving expense: {str(e)}")
             raise ExpenseError(f"Error approving expense: {str(e)}")
-    
+
     async def reject_expense(
         self,
         school_id: str,
@@ -489,21 +620,24 @@ class ExpenseService:
                 )
             
             # ⭐ CRITICAL: Create GL journal entry (updates GL balances)
-            journal_entry_id = await self._create_expense_journal_entry(
+            journal_entry_id, base_currency_amount, exchange_rate_applied = await self._create_expense_journal_entry(
                 school_id=school_id,
                 expense=expense,
                 posted_by=posted_by,
                 ip_address=ip_address,
                 user_role=user_role,
             )
-            
-            # Update expense
+
+            # Update expense — all together, only once posting actually
+            # succeeded (see _create_expense_journal_entry's docstring note).
             expense.status = ExpenseStatus.POSTED
             expense.posted_date = datetime.utcnow()
             expense.posted_by = posted_by
             expense.posted_ip = ip_address
             expense.journal_entry_id = journal_entry_id
             expense.gl_posting_reference = f"JE-{journal_entry_id[:8]}"
+            expense.base_currency_amount = base_currency_amount
+            expense.exchange_rate_applied = exchange_rate_applied
             expense.updated_at = datetime.utcnow()
             
             self.session.add(expense)
@@ -526,7 +660,7 @@ class ExpenseService:
         self,
         school_id: str,
         expense_id: str,
-        amount_paid: float,
+        amount_paid: Decimal,
         paid_by: str,
         payment_date: datetime,
     ) -> Dict[str, Any]:
@@ -568,22 +702,42 @@ class ExpenseService:
             expense.amount_paid = total_paid
             expense.paid_by = paid_by
             expense.payment_date = payment_date
-            
+
             # Update payment status
             remaining = expense.amount - total_paid
-            if remaining < 0.01:  # Account for rounding
+            if remaining < Decimal("0.01"):  # Account for rounding
                 expense.payment_status = PaymentStatus.PAID.value
-            elif total_paid > 0.01:
+            elif total_paid > Decimal("0.01"):
                 expense.payment_status = PaymentStatus.PARTIAL.value
             else:
                 expense.payment_status = PaymentStatus.OUTSTANDING.value
-            
+
             expense.updated_at = datetime.utcnow()
             self.session.add(expense)
+
+            # Clear the payable as cash actually goes out (Dr Accounts
+            # Payable / Cr Bank) — only once the expense itself has
+            # actually been posted to GL (an unposted DRAFT/PENDING/
+            # APPROVED expense has no payable on the books yet to clear).
+            # Previously this function never touched the GL at all — its
+            # own router endpoint's docstring said outright "Does not
+            # affect GL posting."
+            payment_journal_entry_id = None
+            if expense.status == ExpenseStatus.POSTED:
+                try:
+                    payment_journal_entry_id = await self._create_expense_payment_journal_entry(
+                        school_id=school_id, expense=expense, amount_paid=amount_paid, paid_by=paid_by, payment_date=payment_date,
+                    )
+                except Exception as e:
+                    logger.error(f"Error posting expense payment journal entry for {expense_id}: {str(e)}")
+
             await self.session.commit()
-            
+
             logger.info(f"Recorded {amount_paid} payment for expense {expense_id}")
-            return await self._expense_to_dict(expense)
+            result_dict = await self._expense_to_dict(expense)
+            if payment_journal_entry_id:
+                result_dict["payment_journal_entry_id"] = payment_journal_entry_id
+            return result_dict
         except (ExpenseError, ExpenseValidationError):
             await self.session.rollback()
             raise
@@ -628,9 +782,9 @@ class ExpenseService:
                 "approved_count": 0,
                 "posted_count": 0,
                 "rejected_count": 0,
-                "total_amount": 0.0,
-                "total_paid": 0.0,
-                "outstanding_amount": 0.0,
+                "total_amount": Decimal("0"),
+                "total_paid": Decimal("0"),
+                "outstanding_amount": Decimal("0"),
                 "by_category": {}
             }
             
@@ -657,8 +811,8 @@ class ExpenseService:
                 if cat not in summary["by_category"]:
                     summary["by_category"][cat] = {
                         "count": 0,
-                        "total_amount": 0.0,
-                        "total_paid": 0.0
+                        "total_amount": Decimal("0"),
+                        "total_paid": Decimal("0"),
                     }
                 summary["by_category"][cat]["count"] += 1
                 summary["by_category"][cat]["total_amount"] += expense.amount
@@ -676,15 +830,28 @@ class ExpenseService:
         posted_by: str,
         ip_address: Optional[str] = None,
         user_role: str = "finance",
-    ) -> str:
+    ) -> Tuple[str, Decimal, Decimal]:
         """Create and post GL journal entry for expense
-        
+
         **CRITICAL OPERATION** - Posts:
         - Dr. Expense GL account: amount
-        - Cr. Bank account (1010): amount
-        
+        - Cr. Accounts Payable (2200): amount
+
+        Previously this credited the Bank account directly, meaning EVERY
+        expense posted as if it was paid in cash the same day regardless of
+        payment_status — there was no way to record "we owe this, due in
+        30 days" at all, and no vendor-owed (accounts payable) balance ever
+        existed on the books. Now posts a real payable; record_payment
+        clears it (Dr Accounts Payable / Cr Bank) as cash actually goes out.
+
         Updates GL account balances via journal entry posting.
-        
+
+        Returns:
+            (journal_entry_id, base_currency_amount, exchange_rate_applied) —
+            the caller is responsible for writing these onto the Expense
+            once it's actually finished POSTED, not before (see the note in
+            the method body on why this doesn't mutate `expense` itself).
+
         Args:
             school_id: School identifier
             expense: Expense to post
@@ -718,56 +885,99 @@ class ExpenseService:
         if not expense_account:
             raise ExpenseError(f"GL account {expense.gl_account_id} not found or inactive")
         
-        # Get bank account (1010)
-        result = await self.session.execute(
-            select(GLAccount).where(
-                and_(
-                    GLAccount.school_id == school_id,
-                    GLAccount.account_code == "1010",
-                    GLAccount.is_active == True
-                )
-            )
+        # The accounts-payable liability this expense is posted against —
+        # looked up by system_role so a school can rename/replace 2200
+        # without breaking expense posting (falls back to "2200" for
+        # schools seeded before system_role existed on this account).
+        payable_account = await CoaService(self.session).get_system_account(
+            school_id=school_id,
+            system_role="accounts_payable_vendors",
+            fallback_code="2200",
         )
-        bank_account = result.scalar_one_or_none()
-        
-        if not bank_account:
-            raise ExpenseError("GL Account 1010 (Business Checking Account) not found or inactive")
-        
-        # Build journal entry
+
+        if not payable_account:
+            raise ExpenseError(
+                "No accounts payable account configured (expected a GL account with "
+                "system_role='accounts_payable_vendors' or account code 2200)"
+            )
+
+        # GL accounts have no currency of their own — they're implicitly in
+        # the school's base currency. An expense recorded in any other
+        # currency must be converted before posting, using the rate
+        # applicable on expense_date, or every non-base-currency expense
+        # would silently post its foreign-currency face value straight into
+        # base-currency accounts.
+        base_currency = await ExchangeRateService(self.session).get_school_base_currency(school_id)
+        if expense.currency.upper() != base_currency.upper():
+            rate = await ExchangeRateService(self.session).get_rate(
+                school_id=school_id,
+                from_currency=expense.currency,
+                to_currency=base_currency,
+                as_of_date=expense.expense_date,
+            )
+            if rate is None:
+                raise ExpenseError(
+                    f"No exchange rate found for {expense.currency} -> {base_currency} "
+                    f"on or before {expense.expense_date.date()}. Record one before posting."
+                )
+            posting_amount = (expense.amount * rate).quantize(Decimal("0.01"))
+            base_currency_amount = posting_amount
+            exchange_rate_applied = rate
+        else:
+            posting_amount = expense.amount
+            base_currency_amount = expense.amount
+            exchange_rate_applied = Decimal("1")
+
+        # Build journal entry. posting_amount is already Decimal — no float()
+        # round-trip here, which would otherwise reintroduce binary-float
+        # rounding right before the two sides get compared for balance.
         journal_line_items = [
             # Debit: Expense account
             JournalLineItemCreate(
                 gl_account_id=expense_account.id,
-                debit_amount=float(expense.amount),
-                credit_amount=0.0,
+                debit_amount=posting_amount,
+                credit_amount=Decimal("0"),
                 description=f"{expense.category.value}: {expense.description}",
             ),
-            # Credit: Bank account
+            # Credit: Accounts Payable (a bill owed, not cash already gone)
             JournalLineItemCreate(
-                gl_account_id=bank_account.id,
-                debit_amount=0.0,
-                credit_amount=float(expense.amount),
-                description=f"Payment for {expense.description}",
+                gl_account_id=payable_account.id,
+                debit_amount=Decimal("0"),
+                credit_amount=posting_amount,
+                description=f"Payable to {expense.vendor_name or 'vendor'} - {expense.description}",
             ),
         ]
-        
+
+        base_note = f"Expense from {expense.vendor_name or 'vendor'}" if expense.vendor_name else "Expense posting"
+        if expense.currency.upper() != base_currency.upper():
+            base_note += (
+                f" ({expense.amount} {expense.currency.upper()} @ {exchange_rate_applied} "
+                f"= {posting_amount} {base_currency.upper()})"
+            )
+
         entry_data = JournalEntryCreate(
             entry_date=expense.expense_date,
             reference_type=ReferenceType.EXPENSE,
             reference_id=expense.id,
             description=f"Expense: {expense.description}",
             line_items=journal_line_items,
-            notes=f"Expense from {expense.vendor_name or 'vendor'}" if expense.vendor_name else "Expense posting",
+            notes=base_note,
         )
-        
-        # Create and post entry (⭐ this updates GL balances)
+
+        # Create and post entry (⭐ this updates GL balances). Deliberately
+        # not mutating `expense` at all until this succeeds — create_entry()
+        # commits internally, and since it shares this same session, that
+        # commit would otherwise persist any earlier attribute changes made
+        # on `expense` even if post_entry() then fails (e.g. the period
+        # being locked), leaving a half-posted-looking expense with
+        # conversion numbers set but no journal_entry_id or POSTED status.
         journal_service = JournalEntryService(self.session)
         entry = await journal_service.create_entry(
             school_id=school_id,
             entry_data=entry_data,
             created_by="SYSTEM",
         )
-        
+
         posted_entry = await journal_service.post_entry(
             school_id=school_id,
             entry_id=entry.id,
@@ -776,9 +986,64 @@ class ExpenseService:
             ip_address=ip_address,
             user_role=user_role,
         )
-        
+
+        return posted_entry.id, base_currency_amount, exchange_rate_applied
+
+    async def _create_expense_payment_journal_entry(
+        self,
+        school_id: str,
+        expense: Expense,
+        amount_paid: Decimal,
+        paid_by: str,
+        payment_date: datetime,
+    ) -> Optional[str]:
+        """Dr Accounts Payable (2200) / Cr Bank — the payable this expense
+        posted at post_expense_to_gl time being cleared as cash actually
+        goes out. Posted in the expense's OWN currency conversion (using
+        base_currency_amount's implied rate) so a foreign-currency
+        expense's payment clears the exact payable amount that was posted,
+        not a fresh conversion at today's rate."""
+        from services.journal_entry_service import JournalEntryService
+
+        payable_account = await CoaService(self.session).get_system_account(
+            school_id=school_id, system_role="accounts_payable_vendors", fallback_code="2200",
+        )
+        if not payable_account:
+            raise ExpenseError("No accounts payable account configured")
+
+        bank_account = await CoaService(self.session).get_system_account(
+            school_id=school_id, system_role="default_cash_account", fallback_code="1010",
+        )
+        if not bank_account:
+            raise ExpenseError("No default cash account configured")
+
+        # Convert the payment using the SAME rate the original posting
+        # used, not a fresh lookup — a payable of 1000 EUR posted at 12.5
+        # (=12,500 GHS) must clear exactly 12,500 GHS when fully paid,
+        # regardless of what today's EUR rate happens to be.
+        if expense.exchange_rate_applied and expense.exchange_rate_applied != Decimal("1"):
+            posting_amount = (amount_paid * expense.exchange_rate_applied).quantize(Decimal("0.01"))
+        else:
+            posting_amount = amount_paid
+
+        entry_data = JournalEntryCreate(
+            entry_date=payment_date,
+            reference_type=ReferenceType.EXPENSE,
+            reference_id=expense.id,
+            description=f"Payment to {expense.vendor_name or 'vendor'} for {expense.description}",
+            line_items=[
+                JournalLineItemCreate(gl_account_id=payable_account.id, debit_amount=posting_amount, credit_amount=Decimal("0"), description=f"Payable cleared - {expense.description}"),
+                JournalLineItemCreate(gl_account_id=bank_account.id, debit_amount=Decimal("0"), credit_amount=posting_amount, description=f"Payment to {expense.vendor_name or 'vendor'}"),
+            ],
+            notes=f"Auto-posted expense payment for {expense.id}",
+        )
+        journal_service = JournalEntryService(self.session)
+        entry = await journal_service.create_entry(school_id=school_id, entry_data=entry_data, created_by=paid_by)
+        posted_entry = await journal_service.post_entry(
+            school_id=school_id, entry_id=entry.id, posted_by=paid_by, approval_notes="Auto-posted expense payment",
+        )
         return posted_entry.id
-    
+
     async def _expense_to_dict(self, expense: Expense) -> Dict[str, Any]:
         """Convert Expense object to dictionary"""
         return {
@@ -789,6 +1054,8 @@ class ExpenseService:
             "vendor_name": expense.vendor_name,
             "amount": expense.amount,
             "currency": expense.currency,
+            "base_currency_amount": expense.base_currency_amount,
+            "exchange_rate_applied": expense.exchange_rate_applied,
             "gl_account_id": expense.gl_account_id,
             "gl_account_code": expense.gl_account_code,
             "expense_date": expense.expense_date,
@@ -801,6 +1068,7 @@ class ExpenseService:
             "approved_date": expense.approved_date,
             "rejected_reason": expense.rejected_reason,
             "journal_entry_id": expense.journal_entry_id,
+            "receipt_url": expense.receipt_url,
             "notes": expense.notes,
             "created_by": expense.created_by,
             "created_at": expense.created_at,

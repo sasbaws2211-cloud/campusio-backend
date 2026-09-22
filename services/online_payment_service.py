@@ -3,11 +3,13 @@ import logging
 import uuid
 from datetime import datetime, timedelta
 from typing import Dict, Optional
+from fastapi import BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import and_
 from sqlmodel import select
 
 from models.fee import Fee, FeePayment, FeeStructure, PaymentStatus, PaymentMethod, FeeType
+from models.school import School
 from models.student import Parent, Student
 from models.payment import OnlineTransaction, TransactionStatus, PaymentVerification, TransactionType
 from models.finance import JournalEntry, JournalLineItem, ReferenceType, JournalEntryCreate, JournalLineItemCreate
@@ -15,6 +17,9 @@ from models.finance.chart_of_accounts import GLAccount
 from services.paystack_service import PaystackService
 from services.sms_service import sms_service  # Existing SMS service
 from services.journal_entry_service import JournalEntryService
+from services.canteen_wallet_service import CanteenWalletService
+from services.extra_class_service import apply_billing_payment
+from services.receipt_sequence_service import get_next_receipt_number
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +29,17 @@ class OnlinePaymentService:
     
     def __init__(self, paystack_secret_key: str):
         self.paystack = PaystackService(paystack_secret_key)
-    
+
+    async def _get_school_subaccount(self, session: AsyncSession, school_id: str) -> Optional[str]:
+        """A verified school's Paystack subaccount code, so a fee payment splits and
+        settles straight to the school's own bank/MoMo account instead of the
+        platform's pooled main balance. None for schools that haven't been
+        verified for direct settlement — those payments fall back to the
+        platform's main balance, same as before this existed."""
+        result = await session.execute(select(School).where(School.id == school_id))
+        school = result.scalar_one_or_none()
+        return school.paystack_subaccount_code if school else None
+
     async def initiate_payment(
         self,
         session: AsyncSession,
@@ -83,11 +98,11 @@ class OnlinePaymentService:
                 logger.error(f"Parent record not found: {parent_id}")
                 return {"success": False, "error": "Parent not found"}
             
-            # Calculate amount due (total - already paid)
-            amount_due = fee.amount_due - fee.amount_paid
+            # Calculate amount due (total - already paid - discount)
+            amount_due = fee.amount_due - fee.amount_paid - (fee.discount or 0)
             if amount_due <= 0:
                 return {"success": False, "error": "No amount due"}
-            
+
             # Use custom amount if provided, otherwise use full balance
             if amount_to_pay is not None:
                 if amount_to_pay <= 0:
@@ -97,7 +112,7 @@ class OnlinePaymentService:
                 payment_amount = amount_to_pay
             else:
                 payment_amount = amount_due
-            
+
             # Create transaction record
             transaction_id = f"TXN-{uuid.uuid4().hex[:12].upper()}"
             
@@ -126,11 +141,13 @@ class OnlinePaymentService:
                 "is_partial": amount_to_pay is not None
             }
             
+            subaccount = await self._get_school_subaccount(session, school_id)
             paystack_result = await self.paystack.initialize_payment(
                 amount_kobo=amount_kobo,
                 email=parent_email,
                 reference=transaction_id,
-                metadata=metadata
+                metadata=metadata,
+                subaccount=subaccount,
             )
             
             if paystack_result["success"]:
@@ -194,7 +211,7 @@ class OnlinePaymentService:
             if fee.school_id != school_id:
                 return {"success": False, "error": "Unauthorized fee access"}
 
-            amount_due = fee.amount_due - fee.amount_paid
+            amount_due = fee.amount_due - fee.amount_paid - (fee.discount or 0)
             if amount_due <= 0:
                 return {"success": False, "error": "No outstanding balance on this fee"}
 
@@ -270,6 +287,7 @@ class OnlinePaymentService:
             session.add(transaction)
             await session.flush()
 
+            subaccount = await self._get_school_subaccount(session, school_id)
             result = await self.paystack.charge_mobile_money(
                 amount_kobo=int(payment_amount * 100),
                 email=parent_email,
@@ -282,6 +300,7 @@ class OnlinePaymentService:
                     "transaction_id": transaction_id,
                     "school_initiated": True,
                 },
+                subaccount=subaccount,
             )
 
             if result["success"]:
@@ -311,7 +330,8 @@ class OnlinePaymentService:
     async def process_webhook(
         self,
         session: AsyncSession,
-        payload: Dict
+        payload: Dict,
+        background_tasks: Optional[BackgroundTasks] = None
     ) -> Dict:
         """
         Process webhook from Paystack
@@ -407,7 +427,58 @@ class OnlinePaymentService:
                 transaction.verified_at = datetime.utcnow()
                 transaction.gateway_response = str(paystack_data)
                 session.add(transaction)
-                
+
+                # Canteen top-ups are a distinct money flow (crediting a
+                # prepaid wallet, not paying down a school fee) — handled
+                # here and returned early so it never touches fee
+                # distribution below. Previously this was inferred from
+                # fee_id == student_id and ran *after* fee distribution had
+                # already consumed the same amount_paid into FeePayments,
+                # double-applying a single payment to both a fee balance and
+                # the canteen wallet.
+                # Admission application fees are also a distinct money flow —
+                # there is no Student/Fee yet, just a public Applicant — so
+                # this returns early too, same reasoning as canteen top-ups
+                # and extra-class billing above.
+                if transaction.transaction_type == TransactionType.ADMISSION_FEE:
+                    result = await self._apply_admission_fee_payment(session, transaction)
+                    await session.commit()
+                    logger.info("Applied admission fee payment via webhook: %s", result)
+                    return {"success": True, "processed": True}
+
+                # Admission deposits are also a distinct money flow — same
+                # early-return reasoning as admission fees above, but this
+                # settles an AdmissionDeposit's paid_amount, not the
+                # Applicant record itself.
+                if transaction.transaction_type == TransactionType.ADMISSION_DEPOSIT:
+                    result = await self._apply_admission_deposit_payment(session, transaction)
+                    await session.commit()
+                    logger.info("Applied admission deposit payment via webhook: %s", result)
+                    return {"success": True, "processed": True}
+
+                if transaction.transaction_type == TransactionType.CANTEEN_TOPUP:
+                    wallet_service = CanteenWalletService(session)
+                    wallet_result = await wallet_service.apply_topup(
+                        session=session,
+                        transaction=transaction,
+                        amount=amount_paid,
+                        description="Paystack wallet top-up",
+                    )
+                    await session.commit()
+                    logger.info("Applied canteen wallet top-up via webhook: %s", wallet_result)
+                    return {"success": True, "processed": True}
+
+                # Extra-class billing cycles are also a distinct money flow
+                # (settling a teacher-led class's billing cycle, not a
+                # school fee) — same early-return pattern as canteen top-ups
+                # above, for the same reason: it must never also run through
+                # fee distribution below.
+                if transaction.transaction_type == TransactionType.EXTRA_CLASS_FEE:
+                    billing_result = await apply_billing_payment(session=session, transaction=transaction)
+                    await session.commit()
+                    logger.info("Applied extra-class billing payment via webhook: %s", billing_result)
+                    return {"success": True, "processed": True}
+
                 # Distribute payment to fees (handles overpayment automatically)
                 remaining_amount, fee_payments = await self._distribute_payment_to_fees(
                     session=session,
@@ -417,7 +488,7 @@ class OnlinePaymentService:
                     reference_number=reference,
                     received_by="online_system"
                 )
-                
+
                 # Flush to ensure all FeePayments have IDs
                 await session.flush()
                 
@@ -434,6 +505,21 @@ class OnlinePaymentService:
                     )
                     transaction.refund_status = "pending"
                     transaction.refund_amount = round(remaining_amount, 2)
+
+                    # Recognize the excess as a liability the moment it's
+                    # flagged (Dr Paystack Clearing / Cr Refunds Payable) —
+                    # previously this cash had ZERO GL representation until
+                    # someone remembered to refund it, silently
+                    # understating GL cash for that whole window even
+                    # though the school's Paystack balance genuinely holds
+                    # the money.
+                    try:
+                        from services import fee_gl_service
+                        transaction.refund_liability_journal_entry_id = await fee_gl_service.post_refund_liability(
+                            session, school_id, transaction, remaining_amount, cash_account_code="1040",
+                        )
+                    except Exception as e:
+                        logger.error(f"Error posting refund liability journal entry for transaction {transaction.id}: {str(e)}")
                 
                 # Update transaction with first fee payment ID (for reference)
                 if fee_payments:
@@ -465,7 +551,19 @@ class OnlinePaymentService:
                     f"Total amount: GHS {amount_paid}, "
                     f"Distributed to {len(fee_payments)} fee(s)"
                 )
-                
+
+                if background_tasks is not None:
+                    from services.webhook_service import emit_event
+                    await emit_event(
+                        session, background_tasks, transaction.school_id, "payment.completed",
+                        {
+                            "transaction_id": str(transaction.id),
+                            "student_id": transaction.student_id,
+                            "reference": reference,
+                            "amount_paid": amount_paid,
+                        },
+                    )
+
                 return {"success": True, "processed": True}
             
             else:
@@ -485,6 +583,88 @@ class OnlinePaymentService:
             await session.rollback()
             return {"success": False, "error": str(e)}
     
+    async def _apply_admission_fee_payment(
+        self,
+        session: AsyncSession,
+        transaction: OnlineTransaction,
+    ) -> Dict:
+        """Marks the Applicant's fee paid and moves it out of INQUIRY, then emails
+        the guardian a confirmation. `transaction.student_id` holds Applicant.id
+        here — there's no real Student yet, this transaction type just reuses
+        the column (same trick CANTEEN_TOPUP uses for fee_id)."""
+        from models.admissions import Applicant, ApplicationStatus
+
+        result = await session.execute(select(Applicant).where(Applicant.id == transaction.student_id))
+        applicant = result.scalar_one_or_none()
+        if not applicant:
+            logger.warning(f"Admission fee webhook for unknown applicant: {transaction.student_id}")
+            return {"applied": False, "reason": "applicant_not_found"}
+
+        applicant.application_fee_paid = True
+        if applicant.status == ApplicationStatus.INQUIRY:
+            applicant.status = ApplicationStatus.APPLIED
+        applicant.updated_at = datetime.utcnow()
+        session.add(applicant)
+
+        if applicant.guardian_email:
+            try:
+                school_result = await session.execute(select(School).where(School.id == applicant.school_id))
+                school = school_result.scalar_one_or_none()
+                from services.email_service import email_service
+                await email_service.send_admission_confirmation(
+                    to=applicant.guardian_email,
+                    applicant_name=f"{applicant.first_name} {applicant.last_name}",
+                    school_name=school.name if school else "the school",
+                    fee_paid=True,
+                    amount=transaction.amount_paid,
+                )
+            except Exception as e:
+                logger.error(f"Failed to send admission confirmation email: {e}")
+
+        return {"applied": True, "applicant_id": applicant.id}
+
+    async def _apply_admission_deposit_payment(
+        self,
+        session: AsyncSession,
+        transaction: OnlineTransaction,
+    ) -> Dict:
+        """Credits the paid amount to the AdmissionDeposit and emails the
+        guardian a receipt. `transaction.fee_id` holds AdmissionDeposit.id
+        and `transaction.student_id` holds Applicant.id here — same reused-
+        column trick as `_apply_admission_fee_payment` above, since there's
+        no real Fee/Student for a pre-enrollment applicant."""
+        from models.admissions import Applicant
+        from models.admissions_enterprise import AdmissionDeposit, AdmissionDepositStatus
+
+        result = await session.execute(select(AdmissionDeposit).where(AdmissionDeposit.id == transaction.fee_id))
+        deposit = result.scalar_one_or_none()
+        if not deposit:
+            logger.warning(f"Admission deposit webhook for unknown deposit: {transaction.fee_id}")
+            return {"applied": False, "reason": "deposit_not_found"}
+
+        deposit.paid_amount = min(deposit.paid_amount + transaction.amount_paid, deposit.required_amount)
+        deposit.status = AdmissionDepositStatus.PAID if deposit.paid_amount >= deposit.required_amount else AdmissionDepositStatus.PARTIAL
+        deposit.updated_at = datetime.utcnow()
+        session.add(deposit)
+
+        result = await session.execute(select(Applicant).where(Applicant.id == transaction.student_id))
+        applicant = result.scalar_one_or_none()
+        if applicant and applicant.guardian_email:
+            try:
+                from services.email_service import email_service
+                balance = deposit.required_amount - deposit.paid_amount
+                balance_clause = f" A balance of GHS {balance:,.2f} remains." if balance > 0 else " This deposit is now fully paid."
+                await email_service.send_email(
+                    to=[applicant.guardian_email],
+                    subject="Admission deposit payment received",
+                    html_body=f"<p>Dear {applicant.guardian_name},</p><p>We received a payment of GHS {transaction.amount_paid:,.2f} towards {applicant.first_name}'s admission deposit.{balance_clause}</p>",
+                    text_body=f"We received a payment of GHS {transaction.amount_paid:,.2f} towards {applicant.first_name}'s admission deposit.{balance_clause}",
+                )
+            except Exception as e:
+                logger.error(f"Failed to send deposit payment confirmation email: {e}")
+
+        return {"applied": True, "deposit_id": deposit.id, "status": deposit.status.value}
+
     async def _send_payment_notifications(
         self,
         session: AsyncSession,
@@ -506,8 +686,8 @@ class OnlinePaymentService:
                 return
             
             # Calculate balance
-            balance = fee.amount_due - fee.amount_paid
-            
+            balance = fee.amount_due - fee.amount_paid - (fee.discount or 0)
+
             # SMS notification
             message = (
                 f"Fee payment of GHS {transaction.amount_paid:.2f} received. "
@@ -588,7 +768,7 @@ class OnlinePaymentService:
                 amount=amount_for_this_fee,
                 payment_method=PaymentMethod.ONLINE_PAYMENT_PAYSTACK.value,
                 reference_number=reference_number,
-                receipt_number=f"RCP-{uuid.uuid4().hex[:8].upper()}",
+                receipt_number=await get_next_receipt_number(session, school_id),
                 payment_date=datetime.utcnow().isoformat(),
                 remarks=f"Online payment via Paystack (Ref: {reference_number})",
                 received_by=received_by
@@ -654,130 +834,18 @@ class OnlinePaymentService:
         amount: float,
     ) -> Optional[str]:
         """
-        Create a journal entry for online fee payment posting to GL.
-        
-        Posts:
-        - Dr. 1010 (Business Checking Account): Payment amount received
-        - Cr. GL account based on fee type:
-          - 4100 for tuition (TUITION)
-          - 4110 for examination (EXAMINATION)
-          - 4120 for sports (SPORTS)
-          - 4130 for ICT (ICT)
-          - 4140 for library (LIBRARY)
-          - 4150 for PTA (PTA)
-          - 4160 for maintenance (MAINTENANCE)
-          - 4100 for other (OTHER)
-        
-        Args:
-            session: AsyncSession
-            school_id: School identifier
-            payment: FeePayment instance
-            fee: Fee instance
-            fee_structure: FeeStructure with fee_type
-            amount: Payment amount
-            
-        Returns:
-            Journal entry ID or None if GL posting fails
+        Create a journal entry for an online (Paystack) fee payment posting
+        to GL: Dr. 1040 (Paystack Clearing Account) / Cr. 1100 (Accounts
+        Receivable) — clearing the receivable that was recognized as
+        revenue at INVOICE time (fee_gl_service.post_fee_invoice), not
+        crediting revenue again here. Posted to the CLEARING account, not
+        1010 (Business Checking) directly — this cash hasn't reached the
+        school's real bank yet; it only does once a settlement withdrawal
+        completes (services.fee_gl_service.post_settlement_withdrawal).
         """
         try:
-            # Map fee type to GL account code
-            fee_type_to_gl_account = {
-                FeeType.TUITION: "4100",
-                FeeType.EXAMINATION: "4110",
-                FeeType.SPORTS: "4120",
-                FeeType.ICT: "4130",
-                FeeType.LIBRARY: "4140",
-                FeeType.PTA: "4150",
-                FeeType.MAINTENANCE: "4160",
-                FeeType.OTHER: "4100",
-            }
-            
-            revenue_account_code = fee_type_to_gl_account.get(fee_structure.fee_type, "4100")
-            
-            # Get GL accounts: 1010 (Bank) and revenue account
-            result = await session.execute(
-                select(GLAccount).where(
-                    and_(
-                        GLAccount.school_id == school_id,
-                        GLAccount.account_code == "1010",
-                        GLAccount.is_active == True
-                    )
-                )
-            )
-            bank_account = result.scalar_one_or_none()
-            
-            if not bank_account:
-                logger.warning(f"GL Account 1010 (Business Checking Account) not found for school {school_id}")
-                return None
-            
-            result = await session.execute(
-                select(GLAccount).where(
-                    and_(
-                        GLAccount.school_id == school_id,
-                        GLAccount.account_code == revenue_account_code,
-                        GLAccount.is_active == True
-                    )
-                )
-            )
-            revenue_account = result.scalar_one_or_none()
-            
-            if not revenue_account:
-                logger.warning(f"GL Account {revenue_account_code} ({fee_structure.fee_type}) not found for school {school_id}")
-                return None
-            
-            # Get student name for description
-            student_result = await session.execute(
-                select(Student).where(Student.id == payment.student_id)
-            )
-            student = student_result.scalar_one_or_none()
-            student_name = f"{student.first_name} {student.last_name}" if student else "Unknown"
-            
-            # Build line items for journal entry
-            journal_line_items = [
-                # Debit: Bank account (deposit received)
-                JournalLineItemCreate(
-                    gl_account_id=bank_account.id,
-                    debit_amount=float(amount),
-                    credit_amount=0.0,
-                    description=f"Online fee payment received from {student_name} - {fee_structure.fee_type}",
-                ),
-                # Credit: Revenue account (fee income recognized)
-                JournalLineItemCreate(
-                    gl_account_id=revenue_account.id,
-                    debit_amount=0.0,
-                    credit_amount=float(amount),
-                    description=f"Fee income from {student_name} - {fee_structure.fee_type} ({payment.receipt_number})",
-                ),
-            ]
-            
-            # Create the journal entry
-            entry_data = JournalEntryCreate(
-                entry_date=datetime.fromisoformat(payment.payment_date) if isinstance(payment.payment_date, str) else payment.payment_date,
-                reference_type=ReferenceType.FEE_PAYMENT,
-                reference_id=payment.id,
-                description=f"Online fee payment from {student_name} ({payment.receipt_number})",
-                line_items=journal_line_items,
-                notes=f"Auto-posted from online fee payment {payment.id} - Paystack",
-            )
-            
-            # Use JournalEntryService to create and post the entry
-            journal_service = JournalEntryService(session)
-            entry = await journal_service.create_entry(
-                school_id=school_id,
-                entry_data=entry_data,
-                created_by="SYSTEM",  # Mark as system-generated
-            )
-            
-            # Post the entry immediately (auto-posting)
-            posted_entry = await journal_service.post_entry(
-                school_id=school_id,
-                entry_id=entry.id,
-                posted_by="SYSTEM",
-                approval_notes="Auto-posted from online fee payment",
-            )
-            
-            return posted_entry.id
-        
+            from services import fee_gl_service
+            return await fee_gl_service.post_fee_payment(session, school_id, payment, amount, cash_account_code="1040")
         except Exception as e:
             logger.error(f"Error creating GL journal entry for online fee payment: {str(e)}")
             return None

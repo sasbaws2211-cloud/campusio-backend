@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Request
 from sqlmodel import select, SQLModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 import csv
 import io
@@ -38,8 +38,12 @@ from models.otp import (
 from database import get_session
 from auth import (
     get_password_hash, verify_password, create_access_token,
-    get_current_user, require_roles
+    get_current_user, require_roles, validate_password_strength,
+    encrypt_onboarding_password, check_login_allowed, check_login_rate_limit,
+    record_login_attempt, revoke_token, security,
 )
+from jose import jwt as jose_jwt
+from config import get_settings
 from utils.otp import (
     create_otp, verify_otp, send_otp_email, send_otp_sms,
     get_otp_settings, create_or_update_otp_settings,
@@ -89,6 +93,14 @@ async def register(
             )
         user_data.school_id = current_user.school_id
 
+    # A campus-scoped admin (User.campus_id set) can only create accounts
+    # within their own campus — their assignment always wins, mirroring
+    # dependencies.py::resolve_write_campus_id used elsewhere for the same
+    # reason. An unscoped admin's chosen campus_id (including None, i.e.
+    # school-wide) passes through.
+    if current_user.campus_id:
+        user_data.campus_id = current_user.campus_id
+
     result = await session.execute(select(User).where(User.email == user_data.email))
     if result.scalar_one_or_none():
         raise HTTPException(
@@ -96,17 +108,20 @@ async def register(
             detail="Email already registered"
         )
 
+    if user_data.password:
+        validate_password_strength(user_data.password)
     plain_password = user_data.password or _generate_password()
 
     user = User(
         email=user_data.email,
         password_hash=get_password_hash(plain_password),
-        plain_text_password=plain_password,
+        plain_text_password=encrypt_onboarding_password(plain_password),
         first_name=user_data.first_name,
         last_name=user_data.last_name,
         phone=user_data.phone,
         role=user_data.role,
         school_id=user_data.school_id,
+        campus_id=user_data.campus_id,
         must_change_password=True,
     )
 
@@ -138,6 +153,7 @@ async def register(
             "phone": user.phone,
             "role": user.role,
             "school_id": user.school_id,
+            "campus_id": user.campus_id,
             "is_active": user.is_active,
             "must_change_password": user.must_change_password,
             "created_at": user.created_at.isoformat(),
@@ -211,7 +227,7 @@ async def bulk_register(
         user = User(
             email=email,
             password_hash=get_password_hash(plain_password),
-            plain_text_password=plain_password,
+            plain_text_password=encrypt_onboarding_password(plain_password),
             first_name=first_name,
             last_name=last_name,
             phone=phone,
@@ -238,29 +254,41 @@ async def bulk_register(
 
 
 @router.post("/login", response_model=dict)
-async def login(credentials: UserLogin, session: AsyncSession = Depends(get_session)):
+async def login(credentials: UserLogin, request: Request, session: AsyncSession = Depends(get_session)):
     """
     Unified login endpoint with intelligent OTP handling.
-    
+
     Step 1: Validates email and password
     - If OTP is required: Returns temporary token + sends OTP
     - If OTP not required: Returns access token directly
     """
+    client_ip = request.client.host if request.client else None
+    await check_login_rate_limit(client_ip)
+    await check_login_allowed(session, credentials.email)
+
     result = await session.execute(select(User).where(User.email == credentials.email))
     user = result.scalar_one_or_none()
-    
+
     if not user or not verify_password(credentials.password, user.password_hash):
+        await record_login_attempt(
+            session, credentials.email, success=False,
+            user_id=user.id if user else None, failure_reason="invalid_credentials", request=request,
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password"
         )
-    
+
     if not user.is_active:
+        await record_login_attempt(
+            session, credentials.email, success=False,
+            user_id=user.id, failure_reason="account_disabled", request=request,
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="User account is disabled"
         )
-    
+
     # Get OTP settings for user
     otp_settings = await get_otp_settings(session, user.id)
     
@@ -294,16 +322,19 @@ async def login(credentials: UserLogin, session: AsyncSession = Depends(get_sess
             print(f"[LOGIN] OTP method is email, sending to {user.email}")
             send_otp_email(user.email, otp_code, f"{user.first_name} {user.last_name}")
         
-        # Create temporary token valid for 10 minutes
+        # Create temporary token valid for 10 minutes — expires_delta must be
+        # passed explicitly; None here would fall through to
+        # create_access_token's own default (access_token_expire_minutes,
+        # currently 24h), which is far too long-lived for a pre-2FA token.
         temp_token = create_access_token(
             data={
                 "sub": user.id,
                 "type": "otp_pending",
                 "otp_id": otp_id
             },
-            expires_delta=None  # Use default 10 minutes
+            expires_delta=timedelta(minutes=10)
         )
-        
+
         return {
             "status": "otp_required",
             "temporary_token": temp_token,
@@ -316,9 +347,10 @@ async def login(credentials: UserLogin, session: AsyncSession = Depends(get_sess
         user.last_login = datetime.utcnow()
         session.add(user)
         await session.commit()
-        
+        await record_login_attempt(session, credentials.email, success=True, user_id=user.id, request=request)
+
         access_token = create_access_token(data={"sub": user.id})
-        
+
         return {
             "status": "authenticated",
             "access_token": access_token,
@@ -331,6 +363,7 @@ async def login(credentials: UserLogin, session: AsyncSession = Depends(get_sess
                 "phone": user.phone,
                 "role": user.role,
                 "school_id": user.school_id,
+                "campus_id": user.campus_id,
                 "is_active": user.is_active,
                 "must_change_password": user.must_change_password,
                 "created_at": user.created_at.isoformat(),
@@ -342,32 +375,39 @@ async def login(credentials: UserLogin, session: AsyncSession = Depends(get_sess
 @router.post("/verify-otp", response_model=dict)
 async def verify_otp_code(
     verification: OTPVerificationRequest,
+    request: Request,
     session: AsyncSession = Depends(get_session)
 ):
     """
     Step 2: Verify OTP code and get access token.
     """
+    await check_login_rate_limit(request.client.host if request.client else None)
+    await check_login_allowed(session, verification.email)
+
     # Get user
     result = await session.execute(select(User).where(User.email == verification.email))
     user = result.scalar_one_or_none()
-    
+
     if not user:
+        await record_login_attempt(session, verification.email, success=False, failure_reason="invalid_credentials", request=request)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email"
         )
-    
+
     # Verify OTP
     try:
         await verify_otp(session, user.id, verification.otp_code)
     except HTTPException as e:
+        await record_login_attempt(session, verification.email, success=False, user_id=user.id, failure_reason="invalid_otp", request=request)
         raise e
-    
+
     # Update last login and create final access token
     user.last_login = datetime.utcnow()
     session.add(user)
     await session.commit()
-    
+    await record_login_attempt(session, verification.email, success=True, user_id=user.id, request=request)
+
     access_token = create_access_token(data={"sub": user.id})
     
     return {
@@ -382,6 +422,7 @@ async def verify_otp_code(
             "phone": user.phone,
             "role": user.role,
             "school_id": user.school_id,
+            "campus_id": user.campus_id,
             "is_active": user.is_active,
             "must_change_password": user.must_change_password,
             "created_at": user.created_at.isoformat(),
@@ -447,8 +488,32 @@ async def resend_otp(
 
 
 @router.get("/me", response_model=dict)
-async def get_me(current_user: User = Depends(get_current_user)):
+async def get_me(
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
     """Get current user info"""
+    from services.permission_service import get_user_permissions  # deferred: avoids import cycle
+    from services.plan_gating import get_school_plan_tier, TIER_MODULES, MODULE_LABELS  # deferred: avoids import cycle
+
+    permissions = await get_user_permissions(session, current_user)
+
+    # Plan-tier feature entitlements (services/plan_gating.py) — additive to
+    # `role`/`permissions`, purely for the frontend to show/hide lock icons
+    # on gated nav items without guessing; the backend gate on each router
+    # is still the actual enforcement, this is UI-only. SUPER_ADMIN and a
+    # user with no school_id both bypass every gate server-side (see
+    # require_plan_feature), so they're reported as having every module
+    # unlocked here too, rather than the frontend needing its own copy of
+    # that bypass rule.
+    if current_user.role == UserRole.SUPER_ADMIN or not current_user.school_id:
+        plan_tier = None
+        plan_modules = sorted(MODULE_LABELS.keys())
+    else:
+        tier = await get_school_plan_tier(session, current_user.school_id)
+        plan_tier = tier.value
+        plan_modules = sorted(TIER_MODULES.get(tier, set()))
+
     return {
         "id": current_user.id,
         "email": current_user.email,
@@ -457,10 +522,21 @@ async def get_me(current_user: User = Depends(get_current_user)):
         "phone": current_user.phone,
         "role": current_user.role,
         "school_id": current_user.school_id,
+        "campus_id": current_user.campus_id,
         "is_active": current_user.is_active,
         "must_change_password": current_user.must_change_password,
         "created_at": current_user.created_at.isoformat(),
-        "last_login": current_user.last_login.isoformat() if current_user.last_login else None
+        "last_login": current_user.last_login.isoformat() if current_user.last_login else None,
+        # Fine-grained RBAC (models/rbac.py) — additive to `role`. Empty for
+        # every user until scripts/seed_permissions.py has run for their
+        # school; existing role-based UI gating is unaffected either way.
+        "permissions": sorted(permissions),
+        # Plan-tier feature entitlements (services/plan_gating.py) — see
+        # comment above. plan_tier is null for SUPER_ADMIN/no-school users
+        # (nothing to display), plan_modules always lists every module key
+        # this user can actually reach.
+        "plan_tier": plan_tier,
+        "plan_modules": plan_modules,
     }
 
 
@@ -470,22 +546,74 @@ async def change_password(
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session)
 ):
-    """Change password. Required on first login when must_change_password is True."""
-    new_password = body.new_password
-    if len(new_password) < 8:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Password must be at least 8 characters"
-        )
+    """Change password. Required on first login when must_change_password is True.
 
-    current_user.password_hash = get_password_hash(new_password)
-    current_user.plain_text_password = None
-    current_user.must_change_password = False
-    current_user.updated_at = datetime.utcnow()
-    session.add(current_user)
+    Invalidates every OTHER token already issued for this user (see
+    auth.py's sessions_valid_after check in get_current_user) — a password
+    change is exactly the moment you want every other session logged out,
+    e.g. after a suspected compromise. The token used to make THIS request
+    would otherwise also be caught by that same cutoff, so a fresh
+    access_token is issued in the response for the caller to switch to,
+    rather than logging the person out of the account they just secured.
+    The cache entry is cleared, not just the DB row, because
+    get_current_user's cached-vs-fresh reasoning means it otherwise
+    wouldn't see the new sessions_valid_after until the cached entry's own
+    15-minute TTL happens to expire."""
+    validate_password_strength(body.new_password)
+
+    # current_user may be a cache-reconstructed, session-DETACHED object
+    # (see auth.py's get_current_user: a Redis cache hit builds a fresh
+    # User(**dict) that was never SELECTed in this session) — session.add()
+    # on that always schedules an INSERT, not an UPDATE, and collides on
+    # the primary key. Re-fetch the row so we're mutating something the
+    # session actually knows is persistent.
+    result = await session.execute(select(User).where(User.id == current_user.id))
+    db_user = result.scalar_one()
+
+    db_user.password_hash = get_password_hash(body.new_password)
+    db_user.plain_text_password = None
+    db_user.must_change_password = False
+    db_user.sessions_valid_after = datetime.utcnow()
+    db_user.updated_at = datetime.utcnow()
+    session.add(db_user)
     await session.commit()
 
-    return {"message": "Password changed successfully"}
+    from auth import get_redis
+    redis_client = await get_redis()
+    if redis_client:
+        try:
+            await redis_client.delete(f"user:{db_user.id}")
+        except Exception:
+            pass
+
+    new_access_token = create_access_token(data={"sub": db_user.id})
+
+    return {
+        "message": "Password changed successfully. You've been logged out of any other active sessions.",
+        "access_token": new_access_token,
+        "token_type": "bearer",
+    }
+
+
+@router.post("/logout", response_model=dict)
+async def logout(
+    credentials=Depends(security),
+    current_user: User = Depends(get_current_user),
+):
+    """Explicitly invalidates the token used to make this request, via the
+    jti blacklist in auth.py (see revoke_token) — unlike change-password,
+    this logs out only THIS session, not every session for the account."""
+    try:
+        payload = jose_jwt.decode(credentials.credentials, get_settings().secret_key, algorithms=[get_settings().algorithm])
+    except Exception:
+        return {"message": "Logged out"}
+
+    jti = payload.get("jti")
+    exp = payload.get("exp")
+    if jti and exp:
+        await revoke_token(jti, exp)
+
+    return {"message": "Logged out"}
 
 
 @router.post("/bootstrap-superadmin", response_model=dict)
@@ -513,8 +641,7 @@ async def bootstrap_superadmin(
     if email_taken.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Email already in use")
 
-    if len(body.password) < 8:
-        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    validate_password_strength(body.password)
 
     user = User(
         email=body.email,
@@ -557,8 +684,7 @@ async def create_admin(
     if email_taken.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Email already in use")
 
-    if len(body.password) < 8:
-        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    validate_password_strength(body.password)
 
     user = User(
         email=body.email,
@@ -651,6 +777,7 @@ async def list_users(
             "phone": u.phone,
             "role": u.role,
             "school_id": u.school_id,
+            "campus_id": u.campus_id,
             "is_active": u.is_active,
             "must_change_password": u.must_change_password,
             "created_at": u.created_at.isoformat(),

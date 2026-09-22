@@ -16,6 +16,7 @@ from models.timetable import Timetable, Period
 from models.staff import TeacherAssignment, Staff
 from models.classroom import Class, Subject
 from models.student import Student
+from models.school import AcademicTerm
 from database import get_session
 from auth import get_current_user, require_roles
 from models.user import User, UserRole
@@ -24,15 +25,31 @@ from models.user import User, UserRole
 router = APIRouter(prefix="/teacher/timetable", tags=["teacher-timetable"])
 
 
+async def _resolve_term_id(session: AsyncSession, school_id: str, academic_term_id: Optional[str]) -> Optional[str]:
+    """Without this, every schedule query here ignored term entirely — once a
+    school has more than one term's worth of timetable entries for the same
+    class, they'd all render stacked into the same day/period slots."""
+    if academic_term_id:
+        return academic_term_id
+    result = await session.execute(
+        select(AcademicTerm).where(AcademicTerm.school_id == school_id, AcademicTerm.is_current == True)
+    )
+    term = result.scalar_one_or_none()
+    return term.id if term else None
+
+
 @router.get("/my-schedule", response_model=dict)
 async def get_my_timetable(
+    academic_term_id: Optional[str] = None,
     current_user: User = Depends(require_roles(UserRole.TEACHER)),
     session: AsyncSession = Depends(get_session),
 ):
-    """Get the teacher's complete timetable across all assigned classes."""
+    """Get the teacher's complete timetable across all assigned classes,
+    scoped to the given (or current) academic term."""
     try:
         school_id = current_user.school_id
-        
+        term_id = await _resolve_term_id(session, school_id, academic_term_id)
+
         # Get staff record for current user
         staff_result = await session.execute(
             select(Staff).where(Staff.user_id == current_user.id)
@@ -77,17 +94,19 @@ async def get_my_timetable(
         subject_ids = [a.subject_id for a in assignments]
         
         # Get timetable entries for these classes and this teacher
+        term_filters = [Timetable.academic_term_id == term_id] if term_id else []
         timetable_result = await session.execute(
             select(Timetable).where(
                 and_(
                     Timetable.school_id == school_id,
                     Timetable.class_id.in_(class_ids),
                     Timetable.teacher_id == teacher_id,
+                    *term_filters,
                 )
             )
         )
         timetable_entries = timetable_result.scalars().all()
-        
+
         # Organize by day and period (Mon-Fri only)
         schedule_by_day = {
             "Monday": [],
@@ -150,16 +169,18 @@ async def get_my_timetable(
 @router.get("/class/{class_id}", response_model=dict)
 async def get_class_timetable(
     class_id: str,
+    academic_term_id: Optional[str] = None,
     current_user: User = Depends(require_roles(UserRole.TEACHER)),
     session: AsyncSession = Depends(get_session),
 ):
     """
-    Get timetable for a specific class.
+    Get timetable for a specific class, scoped to the given (or current) term.
     Only accessible to teacher assigned to teach that class.
     """
     try:
         school_id = current_user.school_id
-        
+        term_id = await _resolve_term_id(session, school_id, academic_term_id)
+
         # Get staff record for current user
         staff_result = await session.execute(
             select(Staff).where(Staff.user_id == current_user.id)
@@ -206,11 +227,13 @@ async def get_class_timetable(
             raise HTTPException(status_code=404, detail="Class not found")
         
         # Get all timetable entries for this class
+        term_filters = [Timetable.academic_term_id == term_id] if term_id else []
         timetable_result = await session.execute(
             select(Timetable).where(
                 and_(
                     Timetable.school_id == school_id,
                     Timetable.class_id == class_id,
+                    *term_filters,
                 )
             ).order_by(Timetable.day_of_week, Timetable.period_id)
         )
@@ -319,17 +342,20 @@ async def get_school_periods(
 @router.get("/day/{day_of_week}", response_model=dict)
 async def get_teacher_schedule_by_day(
     day_of_week: str,
+    academic_term_id: Optional[str] = None,
     current_user: User = Depends(require_roles(UserRole.TEACHER)),
     session: AsyncSession = Depends(get_session),
 ):
     """
-    Get teacher's schedule for a specific day of the week.
-    
+    Get teacher's schedule for a specific day of the week, scoped to the
+    given (or current) term.
+
     day_of_week: Monday, Tuesday, Wednesday, Thursday, Friday
     """
     try:
         school_id = current_user.school_id
-        
+        term_id = await _resolve_term_id(session, school_id, academic_term_id)
+
         # Get staff record for current user
         staff_result = await session.execute(
             select(Staff).where(Staff.user_id == current_user.id)
@@ -359,12 +385,14 @@ async def get_teacher_schedule_by_day(
         day_of_week_enum = day_of_week.lower()
         
         # Get timetable entries for this teacher on this day
+        term_filters = [Timetable.academic_term_id == term_id] if term_id else []
         timetable_result = await session.execute(
             select(Timetable).where(
                 and_(
                     Timetable.school_id == school_id,
                     Timetable.teacher_id == teacher_id,
                     Timetable.day_of_week == day_of_week_enum,
+                    *term_filters,
                 )
             ).order_by(Timetable.period_id)
         )

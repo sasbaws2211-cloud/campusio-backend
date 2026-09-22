@@ -1,9 +1,26 @@
 """Chart of Accounts models for general ledger management"""
 from sqlmodel import SQLModel, Field
-from typing import Optional
+from typing import Optional, Annotated
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
+from pydantic import PlainSerializer
 import uuid
+
+# Precision for all money fields: 14 integer digits, 2 decimal places.
+# Plenty of headroom for school-level GL amounts while keeping every balance
+# an exact Decimal instead of a binary float that can't represent 0.1 exactly.
+MONEY_MAX_DIGITS = 14
+MONEY_DECIMAL_PLACES = 2
+
+# Use in *response* models only (not table models or Create/Update inputs).
+# Pydantic v2's default JSON encoding renders Decimal as a *string* (to
+# preserve precision) — fine for storage, but every finance API response
+# would otherwise start returning "123.45" instead of 123.45, breaking
+# frontend code that does arithmetic or .toFixed() on these values. This
+# keeps Decimal as the Python/validation type but serializes to a JSON
+# number, matching what the API returned before this field was Decimal.
+Money = Annotated[Decimal, PlainSerializer(lambda v: float(v), return_type=float, when_used="json")]
 
 
 class AccountType(str, Enum):
@@ -76,16 +93,37 @@ class GLAccount(SQLModel, table=True):
     description: Optional[str] = None
     normal_balance: str = Field(default="debit")  # "debit" or "credit" - which side increases the balance
     
-    # Hierarchy (for sub-ledgers and reporting structure)
+    # Hierarchy (for sub-ledgers and reporting structure) — this is the ONE
+    # natural chart-of-accounts tree (e.g. "1100 AR" nests under "1000
+    # Assets"). models/finance/account_hierarchy.py is a deliberately
+    # separate feature for MULTIPLE overlapping rollup dimensions on top of
+    # this tree (organizational/cost-center, functional, program/fund) —
+    # not a duplicate of this field, see that module's docstring.
     parent_account_id: Optional[str] = None  # For creating hierarchical account structures
-    
+
+    # System role: marks an account as filling a well-known function (e.g.
+    # "default_cash_account", "retained_earnings") that other services look up
+    # by role instead of a hardcoded account_code. Lets a school rename/replace
+    # which account fills that role without breaking expense posting or period
+    # close. None means the account has no special system role.
+    system_role: Optional[str] = Field(default=None, index=True)
+
     # Status
     is_active: bool = Field(default=True, index=True)
     
     # ⭐ BALANCE TRACKING (CRITICAL FOR PERFORMANCE & ACCURACY)
-    current_balance: float = Field(default=0.0)  # Denormalized balance for performance
-    opening_balance: float = Field(default=0.0)  # Period opening balance (for comparisons)
-    bank_reconciled_balance: Optional[float] = None  # Last reconciled balance
+    # Decimal/Numeric, not float — a binary float can't represent amounts
+    # like 0.10 exactly, which compounds into real drift across thousands of
+    # postings on a denormalized running balance like this one.
+    current_balance: Decimal = Field(
+        default=Decimal("0"), max_digits=MONEY_MAX_DIGITS, decimal_places=MONEY_DECIMAL_PLACES
+    )  # Denormalized balance for performance
+    opening_balance: Decimal = Field(
+        default=Decimal("0"), max_digits=MONEY_MAX_DIGITS, decimal_places=MONEY_DECIMAL_PLACES
+    )  # Period opening balance (for comparisons)
+    bank_reconciled_balance: Optional[Decimal] = Field(
+        default=None, max_digits=MONEY_MAX_DIGITS, decimal_places=MONEY_DECIMAL_PLACES
+    )  # Last reconciled balance
     last_balance_update: datetime = Field(default_factory=datetime.utcnow)  # When balance was last updated
     bank_reconciliation_date: Optional[datetime] = None  # When last reconciled to bank
     reconciliation_notes: Optional[str] = None  # Notes on bank reconciliation
@@ -112,6 +150,7 @@ class GLAccountCreate(SQLModel):
     # explicitly for contra accounts (e.g. Accumulated Depreciation, an ASSET with a credit balance).
     normal_balance: Optional[str] = None
     parent_account_id: Optional[str] = None
+    system_role: Optional[str] = None
 
 
 class GLAccountUpdate(SQLModel):
@@ -121,6 +160,7 @@ class GLAccountUpdate(SQLModel):
     description: Optional[str] = None
     normal_balance: Optional[str] = None
     is_active: Optional[bool] = None
+    system_role: Optional[str] = None
 
 
 class GLAccountResponse(SQLModel):
@@ -134,11 +174,12 @@ class GLAccountResponse(SQLModel):
     description: Optional[str]
     normal_balance: str
     parent_account_id: Optional[str]
+    system_role: Optional[str] = None
     is_active: bool
     # ⭐ BALANCE FIELDS (NEW)
-    current_balance: float
-    opening_balance: float
-    bank_reconciled_balance: Optional[float]
+    current_balance: Money
+    opening_balance: Money
+    bank_reconciled_balance: Optional[Money]
     last_balance_update: datetime
     created_by: Optional[str]
     created_at: datetime

@@ -17,7 +17,7 @@ from models.billing import (
     PlatformSubscription, SubscriptionInvoice,
     PlatformSubscriptionResponse, SubscriptionInvoiceResponse,
     GenerateSubscriptionRequest, ProcessSubscriptionPaymentRequest,
-    SubscriptionMetrics, BillingConfiguration, BillingPlan,
+    SubscriptionMetrics, BillingConfiguration, BillingPlan, PlanTier,
     BillingConfigurationResponse
 )
 from typing import Optional
@@ -88,6 +88,23 @@ class UpdateBillingConfigRequest(SQLModel):
     unit_price: Optional[float] = None          # GHS per student per term
     monthly_unit_price: Optional[float] = None  # GHS per student per month
     billing_plan: Optional[BillingPlan] = None  # termly | monthly
+    plan_tier: Optional[PlanTier] = None         # starter | growth | enterprise
+    # Two distinct grace periods, both counted from a subscription's
+    # due_date — see services/late_fee_service.py (grace_period_days) and
+    # services/subscription_suspension_service.py (default_suspension_days).
+    # A school on a negotiated deal (e.g. a slow-paying but valued account)
+    # can get either loosened independently — a longer suspension grace
+    # doesn't require also delaying when late fees start accruing.
+    grace_period_days: Optional[int] = None       # days overdue before a late fee applies
+    default_suspension_days: Optional[int] = None  # days overdue before module access is suspended
+
+
+class UpdateAutoRenewRequest(SQLModel):
+    auto_renew_enabled: bool
+
+
+class UpdatePlanTierRequest(SQLModel):
+    plan_tier: PlanTier  # starter | growth | enterprise
 
 
 def _config_response(config: BillingConfiguration) -> BillingConfigurationResponse:
@@ -102,6 +119,11 @@ def _config_response(config: BillingConfiguration) -> BillingConfigurationRespon
         reminder_days_before_due=config.reminder_days_before_due,
         enable_late_fees=config.enable_late_fees,
         enable_bulk_discounts=config.enable_bulk_discounts,
+        default_suspension_days=config.default_suspension_days,
+        plan_tier=config.plan_tier if isinstance(config.plan_tier, str) else config.plan_tier.value,
+        auto_renew_enabled=config.auto_renew_enabled,
+        paystack_card_last4=config.paystack_card_last4,
+        paystack_card_brand=config.paystack_card_brand,
     )
 
 
@@ -158,6 +180,16 @@ async def update_billing_config(
         config.monthly_unit_price = request_data.monthly_unit_price
     if request_data.billing_plan is not None:
         config.billing_plan = request_data.billing_plan.value
+    if request_data.plan_tier is not None:
+        config.plan_tier = request_data.plan_tier.value
+    if request_data.grace_period_days is not None:
+        if request_data.grace_period_days < 0:
+            raise HTTPException(status_code=400, detail="grace_period_days cannot be negative")
+        config.grace_period_days = request_data.grace_period_days
+    if request_data.default_suspension_days is not None:
+        if request_data.default_suspension_days < 0:
+            raise HTTPException(status_code=400, detail="default_suspension_days cannot be negative")
+        config.default_suspension_days = request_data.default_suspension_days
 
     config.updated_at = datetime.utcnow()
     session.add(config)
@@ -166,7 +198,84 @@ async def update_billing_config(
 
     logger.info(
         f"Billing config updated for school {school_id} by {current_user.id}: "
-        f"unit_price={config.unit_price}, monthly={config.monthly_unit_price}, plan={config.billing_plan}"
+        f"unit_price={config.unit_price}, monthly={config.monthly_unit_price}, plan={config.billing_plan}, "
+        f"tier={config.plan_tier}, grace_period_days={config.grace_period_days}, "
+        f"default_suspension_days={config.default_suspension_days}"
+    )
+    return _config_response(config)
+
+
+@router.put("/config/{school_id}/auto-renew", response_model=BillingConfigurationResponse)
+async def update_auto_renew(
+    school_id: str,
+    request_data: UpdateAutoRenewRequest,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Let a school turn auto-renewal on/off for itself — unlike the rest of
+    /config, this one field is the subscriber's own choice, not a super-admin
+    override. Turning it off doesn't clear the saved card, only stops the
+    scheduler from charging it (see services/scheduler.py)."""
+    if current_user.role == UserRole.SUPER_ADMIN:
+        pass
+    elif current_user.role == UserRole.SCHOOL_ADMIN and current_user.school_id == school_id:
+        pass
+    else:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    result = await session.execute(
+        select(BillingConfiguration).where(BillingConfiguration.school_id == school_id)
+    )
+    config = result.scalar_one_or_none()
+    if not config:
+        config = BillingConfiguration(school_id=school_id)
+        session.add(config)
+
+    config.auto_renew_enabled = request_data.auto_renew_enabled
+    config.updated_at = datetime.utcnow()
+    session.add(config)
+    await session.commit()
+    await session.refresh(config)
+    return _config_response(config)
+
+
+@router.put("/config/{school_id}/plan-tier", response_model=BillingConfigurationResponse)
+async def update_plan_tier(
+    school_id: str,
+    request_data: UpdatePlanTierRequest,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Let a school switch its own subscription plan tier — like auto-renew,
+    this is the subscriber's own choice, not a super-admin override. Pricing
+    (unit_price/monthly_unit_price) and grace periods stay super-admin-only
+    via PUT /config/{school_id} and are NOT affected by this endpoint: a
+    tier change here does not itself change what the school is charged,
+    since price and tier are independent fields on BillingConfiguration."""
+    if current_user.role == UserRole.SUPER_ADMIN:
+        pass
+    elif current_user.role == UserRole.SCHOOL_ADMIN and current_user.school_id == school_id:
+        pass
+    else:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    result = await session.execute(
+        select(BillingConfiguration).where(BillingConfiguration.school_id == school_id)
+    )
+    config = result.scalar_one_or_none()
+    if not config:
+        config = BillingConfiguration(school_id=school_id)
+        session.add(config)
+
+    config.plan_tier = request_data.plan_tier.value
+    config.updated_at = datetime.utcnow()
+    session.add(config)
+    await session.commit()
+    await session.refresh(config)
+
+    logger.info(
+        f"Plan tier for school {school_id} changed to {config.plan_tier} by {current_user.id} "
+        f"(role={current_user.role})"
     )
     return _config_response(config)
 
@@ -780,6 +889,56 @@ async def get_subscription_metrics(
 
 # --- LATE FEES ENDPOINTS ---
 
+@router.get("/subscriptions/overdue/list", status_code=200)
+async def get_overdue_subscriptions(
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session)
+) -> dict:
+    """
+    List subscriptions past due with an outstanding balance (Admin only).
+
+    Data source for the late-fee admin dashboard — lists real subscriptions
+    with subscription_id, invoice_number, days_overdue, and the actual
+    outstanding balance (late fees/discounts included), across all schools
+    for a super admin.
+
+    **Auth Required:** Admin
+
+    **Response:**
+    ```json
+    {
+        "count": 3,
+        "subscriptions": [
+            {
+                "subscription_id": "sub-xxx",
+                "school_id": "school-xxx",
+                "invoice_number": "PLAT-2026-0004",
+                "due_date": "2026-06-15T10:30:00",
+                "days_overdue": 12,
+                "total_amount_due": 168000.00,
+                "amount_paid": 0.00,
+                "late_fee_amount": 0.00,
+                "outstanding": 168000.00,
+                "status": "pending"
+            }
+        ]
+    }
+    ```
+    """
+    if current_user.role != UserRole.SUPER_ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can view overdue subscriptions"
+        )
+
+    from services.late_fee_service import LateFeeService
+
+    service = LateFeeService()
+    subscriptions = await service.get_overdue_subscriptions(session=session, school_id=None)
+
+    return {"count": len(subscriptions), "subscriptions": subscriptions}
+
+
 @router.post("/late-fees/apply", status_code=200)
 async def apply_late_fees(
     current_user: User = Depends(get_current_user),
@@ -808,14 +967,133 @@ async def apply_late_fees(
         )
     
     from services.late_fee_service import LateFeeService
-    
+
     service = LateFeeService()
     result = await service.check_and_apply_late_fees(
         session=session,
         school_id=current_user.school_id if current_user.school_id else None
     )
-    
+
     return result
+
+
+# --- PRORATION ENDPOINTS ---
+
+@router.get("/subscriptions/proration/list", status_code=200)
+async def list_proration_overview(
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session)
+) -> dict:
+    """
+    List subscriptions with an active billing period, showing billed vs
+    live student counts and a preview of any pending (uncharged) proration
+    (Admin only). Data source for the proration admin dashboard.
+
+    **Auth Required:** Admin
+
+    **Response:**
+    ```json
+    {
+        "count": 1,
+        "subscriptions": [
+            {
+                "subscription_id": "sub-xxx",
+                "school_id": "school-xxx",
+                "status": "active",
+                "billed_student_count": 420,
+                "reconciled_student_count": 420,
+                "current_student_count": 435,
+                "pending_delta": 15,
+                "pending_charge_preview": 2600.00,
+                "already_charged": 0.0,
+                "period_end": "2026-11-30T00:00:00",
+                "remaining_days": 13
+            }
+        ]
+    }
+    ```
+    """
+    if current_user.role != UserRole.SUPER_ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can view proration overview"
+        )
+
+    from services.proration_service import ProrationService
+
+    service = ProrationService()
+    subscriptions = await service.list_subscriptions_overview(session=session, school_id=None)
+
+    return {"count": len(subscriptions), "subscriptions": subscriptions}
+
+
+@router.post("/proration/apply", status_code=200)
+async def apply_proration(
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session)
+) -> dict:
+    """
+    Check subscriptions for mid-term student-count growth and charge a
+    prorated amount for the delta (Admin only). Shrinkage issues no credit —
+    see services/proration_service.py for why.
+
+    **Auth Required:** Admin
+
+    **Response:**
+    ```json
+    {
+        "success": true,
+        "subscriptions_prorated": 2,
+        "total_charged": 3200.00,
+        "message": "Applied proration charges to 2 subscriptions"
+    }
+    ```
+    """
+    if current_user.role != UserRole.SUPER_ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can apply proration"
+        )
+
+    from services.proration_service import ProrationService
+
+    service = ProrationService()
+    result = await service.check_and_apply_proration(
+        session=session,
+        school_id=current_user.school_id if current_user.school_id else None
+    )
+
+    return result
+
+
+@router.get("/subscriptions/{subscription_id}/proration-history", status_code=200)
+async def get_proration_history(
+    subscription_id: str,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session)
+) -> dict:
+    """
+    Get proration charge history for a subscription.
+
+    **Auth Required:** Authenticated user (school admin scoped to their own
+    subscription, super admin unrestricted)
+    """
+    sub_result = await session.execute(
+        select(PlatformSubscription).where(PlatformSubscription.id == subscription_id)
+    )
+    subscription = sub_result.scalar_one_or_none()
+    if not subscription:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subscription not found")
+
+    if current_user.role == UserRole.SCHOOL_ADMIN and subscription.school_id != current_user.school_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    from services.proration_service import ProrationService
+
+    service = ProrationService()
+    history = await service.get_proration_history(session=session, subscription_id=subscription_id)
+
+    return {"subscription_id": subscription_id, "count": len(history), "charges": history}
 
 
 @router.post("/subscriptions/{subscription_id}/late-fee/waive", status_code=200)

@@ -21,10 +21,15 @@ from models.finance.account_hierarchy import (
     HierarchyLevel,
 )
 from dependencies import get_current_school_id
-from auth import get_current_user 
+from auth import get_current_user, require_roles
 from database import get_session
+from models.user import User, UserRole
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/account-hierarchy", tags=["Account Hierarchy"])
+
+# Hierarchy structure/relationship edits and rollups affect consolidated
+# financial reporting — same role gate as journal.py's posting endpoints.
+FINANCE_ADMIN_ROLES = (UserRole.SUPER_ADMIN, UserRole.SCHOOL_ADMIN, UserRole.HR)
 
 
 # ==================== Hierarchy Creation ====================
@@ -32,7 +37,7 @@ router = APIRouter(prefix="/account-hierarchy", tags=["Account Hierarchy"])
 @router.post("/hierarchies", response_model=dict)
 async def create_hierarchy(
     body: dict,
-    current_user: dict = Depends(get_current_user),
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -71,8 +76,7 @@ async def create_hierarchy(
         )
     try:
         service = AccountHierarchyService(session)
-        # Handle both dict and User object
-        user_id = current_user.get("id", "unknown") if isinstance(current_user, dict) else getattr(current_user, "id", "unknown")
+        user_id = current_user.id
         hierarchy_id = await service.create_hierarchy(
             school_id=school_id,
             hierarchy_name=hierarchy_name,
@@ -106,6 +110,7 @@ async def create_hierarchy(
 @router.post("/nodes", response_model=dict)
 async def create_hierarchy_node(
     body: dict,
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -184,76 +189,12 @@ async def create_hierarchy_node(
         raise HTTPException(status_code=500, detail="Failed to create node")
 
 
-# ==================== Relationship Management ====================
-
-@router.post("/relationships", response_model=dict)
-async def add_hierarchy_relationship(
-    body: dict,
-    school_id: str = Depends(get_current_school_id),
-    session: AsyncSession = Depends(get_session),
-) -> dict:
-    """Add parent-child relationship in hierarchy
-    
-    Creates linkage between parent and child nodes. Validates against
-    circular references.
-    
-    Args:
-        body: Request body containing:
-            - hierarchy_id: Hierarchy ID
-            - parent_node_id: Parent node ID
-            - child_node_id: Child node ID
-            - child_sequence: Order within parent (optional, default 0)
-            - contribution_percentage: % of child that rolls up (optional, default 100%)
-        school_id: School identifier
-        session: Database session
-        
-    Returns:
-        Relationship confirmation
-    """
-    hierarchy_id = body.get("hierarchy_id")
-    parent_node_id = body.get("parent_node_id")
-    child_node_id = body.get("child_node_id")
-    child_sequence = body.get("child_sequence", 0)
-    contribution_percentage = body.get("contribution_percentage", 100.0)
-    
-    if not hierarchy_id:
-        raise HTTPException(status_code=400, detail="hierarchy_id is required")
-    if not parent_node_id:
-        raise HTTPException(status_code=400, detail="parent_node_id is required")
-    if not child_node_id:
-        raise HTTPException(status_code=400, detail="child_node_id is required")
-    try:
-        service = AccountHierarchyService(session)
-        relationship_id = await service.add_hierarchy_relationship(
-            school_id=school_id,
-            hierarchy_id=hierarchy_id,
-            parent_node_id=parent_node_id,
-            child_node_id=child_node_id,
-            child_sequence=child_sequence,
-            contribution_percentage=contribution_percentage,
-        )
-        
-        return {
-            "status": "success",
-            "relationship_id": relationship_id,
-            "parent_node_id": parent_node_id,
-            "child_node_id": child_node_id,
-            "child_sequence": child_sequence,
-            "contribution_percentage": contribution_percentage,
-        }
-    except AccountHierarchyError as e:
-        logger.warning(f"Error adding relationship: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error in relationship creation: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to add relationship")
-
-
 # ==================== Balance Rollup ====================
 
 @router.post("/rollup/{hierarchy_id}", response_model=dict)
 async def rollup_all_nodes(
     hierarchy_id: str,
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> dict:

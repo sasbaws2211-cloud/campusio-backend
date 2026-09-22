@@ -25,6 +25,26 @@ class BillingPlan(str, Enum):
     MONTHLY = "monthly"  # GHS per student per calendar month (cash-flow flexibility)
 
 
+class PlanTier(str, Enum):
+    """Feature entitlement tier — distinct from BillingPlan, which only
+    controls billing cadence. This is the value ladder: which optional
+    modules a school's users can reach. See services/plan_gating.py for
+    what each tier actually unlocks.
+
+    Plain String column, same reasoning as BillingPlan above.
+
+    STARTER's stored value is unchanged from before STANDARD existed —
+    only its *display* label became "Basic" (see plan_gating.py's
+    _TIER_DISPLAY_NAMES) when a 4th tier was inserted between it and
+    GROWTH. Renaming the stored value would need a data migration for
+    zero benefit, so the value/member name stays STARTER.
+    """
+    STARTER = "starter"
+    STANDARD = "standard"
+    GROWTH = "growth"
+    ENTERPRISE = "enterprise"
+
+
 class PlatformSubscription(SQLModel, table=True):
     """School platform subscription per academic term.
 
@@ -66,11 +86,19 @@ class PlatformSubscription(SQLModel, table=True):
     discount_amount: float = 0.0  # Bulk discount applied
     discount_reason: Optional[str] = None  # e.g., "500+ students"
     discount_percentage: float = 0.0  # e.g., 5.0 for 5%
-    
+
+    # Proration (mid-term student-count growth)
+    proration_adjustment: float = 0.0  # Cumulative prorated charges for student growth after billing
+    # Peak active-student count already billed/prorated for. Starts equal to
+    # student_count at generation and only ever moves up — shrinkage doesn't
+    # lower it (no mid-term credit is issued; see services/proration_service.py)
+    # so a dip-then-recovery back to the original count is never re-charged.
+    reconciled_student_count: Optional[int] = None
+
     # Final Amounts (Phase 2)
     subtotal: float = 0.0  # total_amount_due before discounts
     after_discount: float = 0.0  # total_amount_due - discount_amount
-    final_amount_due: float = 0.0  # after_discount + late_fee_amount
+    final_amount_due: float = 0.0  # after_discount + late_fee_amount + proration_adjustment
     
     # Reconciliation
     invoice_id: Optional[str] = None  # Links to SubscriptionInvoice
@@ -134,6 +162,8 @@ class PlatformSubscriptionResponse(SQLModel):
     unit_price: float
     total_amount_due: float
     amount_paid: float
+    proration_adjustment: float = 0.0  # Cumulative mid-term student-growth charges
+    outstanding_balance: float = 0.0  # subscription_outstanding() — what's actually owed right now
     status: SubscriptionStatus
     billing_plan: str = "termly"
     billing_month: Optional[str] = None
@@ -211,7 +241,21 @@ class BillingConfiguration(SQLModel, table=True):
     
     # Special
     default_suspension_days: int = 14  # Days overdue before suspension
-    
+
+    # Feature tier (separate from billing_plan's cadence) — see PlanTier.
+    plan_tier: PlanTier = Field(default=PlanTier.STARTER, sa_column=Column(String, server_default="starter"))
+
+    # Saved card for auto-renewal. Populated from the `authorization` object
+    # Paystack returns on a successful charge when reusable=True (see the
+    # PLAT- branch of routers/payments.py's webhook handler). Auto-renewal
+    # (services/scheduler.py) falls back to leaving the invoice for manual
+    # checkout whenever this is unset or a charge against it fails.
+    auto_renew_enabled: bool = True
+    paystack_authorization_code: Optional[str] = None
+    paystack_customer_code: Optional[str] = None
+    paystack_card_last4: Optional[str] = None
+    paystack_card_brand: Optional[str] = None
+
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -281,7 +325,34 @@ class LateFeeCharge(SQLModel, table=True):
     
     # Reconciliation
     journal_entry_id: Optional[str] = None  # GL entry for late fee
-    
+
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class ProrationCharge(SQLModel, table=True):
+    """Mid-term student-growth proration charge — append-only audit row,
+    one per proration event (never updated afterwards)."""
+    __tablename__ = "proration_charges"
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    subscription_id: str = Field(index=True)
+    school_id: str = Field(index=True)
+
+    # Growth calculation
+    previous_student_count: int  # Baseline (reconciled_student_count) before this event
+    new_student_count: int  # Active student count observed at check time
+    student_delta: int  # new_student_count - previous_student_count
+    unit_price: float  # Rate used for this charge
+
+    # Period this charge is prorated against
+    period_start: datetime
+    period_end: datetime
+    period_total_days: int
+    remaining_days: int  # Days from applied_date to period_end, used for the fraction
+
+    prorated_amount: float  # student_delta * unit_price * (remaining_days / period_total_days)
+
+    applied_date: datetime = Field(default_factory=datetime.utcnow)
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -301,6 +372,11 @@ class BillingConfigurationResponse(SQLModel):
     reminder_days_before_due: int
     enable_late_fees: bool
     enable_bulk_discounts: bool
+    default_suspension_days: int = 14
+    plan_tier: str = "starter"
+    auto_renew_enabled: bool = True
+    paystack_card_last4: Optional[str] = None
+    paystack_card_brand: Optional[str] = None
 
 
 class BillingReport(SQLModel):

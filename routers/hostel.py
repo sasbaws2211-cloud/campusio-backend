@@ -17,16 +17,54 @@ from models.hostel import (
     HostelFee, HostelFeeCreate, HostelFeeUpdate, HostelFeeType,
     HostelFeeStructure, HostelFeeStructureCreate, HostelFeeStructureUpdate,
     HostelMaintenance, HostelMaintenanceCreate,
-    HostelVisitor, HostelVisitorCreate,
+    RoomInventoryItem, RoomInventoryItemCreate, RoomInventoryItemUpdate,
+    HostelVisitor, HostelVisitorCreate, HostelVisitorUpdate,
     HostelComplaint, HostelComplaintCreate
 )
-from models.student import Student
+from models.student import Student, Parent, StudentParent
 from models.user import User, UserRole
+from models.facilities import FacilityContractor, FacilityWorkOrder
 from database import get_session
 from auth import get_current_user, require_roles
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/hostel", tags=["Hostel Management"])
+
+
+async def _has_student_access(session: AsyncSession, current_user: User, student: Student) -> bool:
+    """Ownership rules for viewing a specific student's hostel
+    accommodation/fee data: admins and teachers see any student in their
+    school; parents only their own children; students only themselves.
+    Previously every student-specific read endpoint below only checked
+    same-school, not that a PARENT/STUDENT caller actually owns/is related
+    to the student in question. Same shape as
+    routers/fees.py::_has_fee_access / routers/transport.py::_has_student_access,
+    applied here since hostel.py never had an equivalent ownership check.
+    Also enforces campus scoping for a campus-restricted SCHOOL_ADMIN/
+    TEACHER — hostel.py never called assert_campus_access anywhere, so
+    such an admin could act on students in every campus of the school,
+    not just their assigned one."""
+    if current_user.role == UserRole.SUPER_ADMIN:
+        return True
+    if current_user.role in (UserRole.SCHOOL_ADMIN, UserRole.TEACHER):
+        if current_user.school_id != student.school_id:
+            return False
+        return not current_user.campus_id or current_user.campus_id == student.campus_id
+    if current_user.role == UserRole.PARENT:
+        parent_result = await session.execute(select(Parent).where(Parent.user_id == current_user.id))
+        parent = parent_result.scalar_one_or_none()
+        if not parent:
+            return False
+        sp_result = await session.execute(
+            select(StudentParent).where(
+                StudentParent.parent_id == parent.id,
+                StudentParent.student_id == student.id
+            )
+        )
+        return sp_result.scalar_one_or_none() is not None
+    if current_user.role == UserRole.STUDENT:
+        return current_user.id == student.user_id
+    return False
 
 
 class UpdateComplaintRequest(SQLModel):
@@ -81,9 +119,10 @@ async def create_hostel(
     if not school_id:
         raise HTTPException(status_code=403, detail="No school context")
     
-    # Check if hostel code already exists
+    # Check if hostel code already exists in this school -- hostel codes are
+    # only unique per-school (see uq_hostels_school_hostel_code)
     result = await session.execute(
-        select(Hostel).where(Hostel.hostel_code == hostel_data.hostel_code)
+        select(Hostel).where(Hostel.hostel_code == hostel_data.hostel_code, Hostel.school_id == school_id)
     )
     if result.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Hostel with this code already exists")
@@ -294,13 +333,16 @@ async def create_room(
     if not school_id:
         raise HTTPException(status_code=403, detail="No school context")
     
-    # Verify hostel exists
+    # Verify hostel exists — school_id scoped, without which a room could
+    # be attached to another school's hostel (with the room's own school_id
+    # set to the caller's school, producing an inconsistent cross-tenant
+    # Room).
     result = await session.execute(
-        select(Hostel).where(Hostel.id == room_data.hostel_id)
+        select(Hostel).where(Hostel.id == room_data.hostel_id, Hostel.school_id == school_id)
     )
     if not result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Hostel not found")
-    
+
     room = Room(**room_data.dict(), school_id=school_id)
     session.add(room)
     await session.commit()
@@ -452,8 +494,148 @@ async def delete_room(
 
 
 # ============================================================================
+# ROOM INVENTORY (condition tracking)
+# ============================================================================
+
+@router.post("/rooms/{room_id}/inventory", response_model=dict)
+async def create_room_inventory_item(
+    room_id: str,
+    item_data: RoomInventoryItemCreate,
+    current_user: User = Depends(require_roles(UserRole.SUPER_ADMIN, UserRole.SCHOOL_ADMIN)),
+    session: AsyncSession = Depends(get_session)
+):
+    """Add an inventory/condition item to a room"""
+    school_id = current_user.school_id
+    if not school_id:
+        raise HTTPException(status_code=403, detail="No school context")
+
+    result = await session.execute(
+        select(Room).where(and_(Room.id == room_id, Room.school_id == school_id))
+    )
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    item = RoomInventoryItem(**item_data.dict(), room_id=room_id, school_id=school_id)
+    session.add(item)
+    await session.commit()
+    await session.refresh(item)
+
+    return jsonable_encoder(item)
+
+
+@router.get("/rooms/{room_id}/inventory", response_model=List[dict])
+async def list_room_inventory(
+    room_id: str,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session)
+):
+    """List inventory/condition items for a room"""
+    school_id = current_user.school_id
+    if not school_id:
+        raise HTTPException(status_code=403, detail="No school context")
+
+    query = select(RoomInventoryItem).where(
+        and_(
+            RoomInventoryItem.room_id == room_id,
+            RoomInventoryItem.school_id == school_id
+        )
+    ).order_by(RoomInventoryItem.item_name.asc())
+    result = await session.execute(query)
+    items = result.scalars().all()
+
+    return [jsonable_encoder(i) for i in items]
+
+
+@router.put("/inventory/{item_id}", response_model=dict)
+async def update_room_inventory_item(
+    item_id: str,
+    update_data: RoomInventoryItemUpdate,
+    current_user: User = Depends(require_roles(UserRole.SUPER_ADMIN, UserRole.SCHOOL_ADMIN)),
+    session: AsyncSession = Depends(get_session)
+):
+    """Update a room inventory/condition item"""
+    school_id = current_user.school_id
+    if not school_id:
+        raise HTTPException(status_code=403, detail="No school context")
+
+    result = await session.execute(
+        select(RoomInventoryItem).where(
+            and_(RoomInventoryItem.id == item_id, RoomInventoryItem.school_id == school_id)
+        )
+    )
+    item = result.scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="Inventory item not found")
+
+    update_data_dict = update_data.dict(exclude_unset=True)
+    for key, value in update_data_dict.items():
+        setattr(item, key, value)
+
+    item.updated_at = datetime.utcnow()
+    session.add(item)
+    await session.commit()
+    await session.refresh(item)
+
+    return jsonable_encoder(item)
+
+
+@router.delete("/inventory/{item_id}", response_model=dict)
+async def delete_room_inventory_item(
+    item_id: str,
+    current_user: User = Depends(require_roles(UserRole.SUPER_ADMIN, UserRole.SCHOOL_ADMIN)),
+    session: AsyncSession = Depends(get_session)
+):
+    """Delete a room inventory/condition item"""
+    school_id = current_user.school_id
+    if not school_id:
+        raise HTTPException(status_code=403, detail="No school context")
+
+    result = await session.execute(
+        select(RoomInventoryItem).where(
+            and_(RoomInventoryItem.id == item_id, RoomInventoryItem.school_id == school_id)
+        )
+    )
+    item = result.scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="Inventory item not found")
+
+    await session.delete(item)
+    await session.commit()
+
+    return {"message": "Inventory item deleted successfully", "id": item_id}
+
+
+# ============================================================================
 # STUDENT ACCOMMODATION
 # ============================================================================
+
+async def _sync_room_occupancy(session: AsyncSession, room_id: str) -> None:
+    """Room.current_occupancy is a persisted counter that every write path
+    tried to maintain incrementally (+=1/-=1) across two independent,
+    parallel occupancy mechanisms -- StudentHostel accommodation and
+    RoomAllocation -- so a missed call site (e.g. RoomAllocation had no
+    reachable deallocate endpoint until recently) desyncs it permanently.
+    Recompute fresh from both sources instead, mirroring
+    _sync_transport_occupancy in routers/transport.py."""
+    room = await session.get(Room, room_id)
+    if not room:
+        return
+
+    accommodation_count = await session.execute(
+        select(func.count(StudentHostel.id)).where(
+            StudentHostel.room_id == room_id,
+            StudentHostel.status == StudentHostelStatus.ACTIVE,
+        )
+    )
+    allocation_count = await session.execute(
+        select(func.count(RoomAllocation.id)).where(
+            RoomAllocation.room_id == room_id,
+            RoomAllocation.deallocation_date.is_(None),
+        )
+    )
+    room.current_occupancy = (accommodation_count.scalar() or 0) + (allocation_count.scalar() or 0)
+    session.add(room)
+
 
 @router.post("/accommodation", response_model=dict)
 async def add_student_accommodation(
@@ -466,13 +648,18 @@ async def add_student_accommodation(
     if not school_id:
         raise HTTPException(status_code=403, detail="No school context")
     
-    # Verify student exists
+    # Verify student exists — school_id scoped, without which a school could
+    # reference another school's student by guessing/reusing their roll
+    # number (this business id is not unique across schools).
     result = await session.execute(
-        select(Student).where(Student.student_id == accommodation_data.student_id)
+        select(Student).where(Student.student_id == accommodation_data.student_id, Student.school_id == school_id)
     )
-    if not result.scalar_one_or_none():
+    student = result.scalar_one_or_none()
+    if not student:
         raise HTTPException(status_code=404, detail="Student not found")
-    
+    if not await _has_student_access(session, current_user, student):
+        raise HTTPException(status_code=403, detail="Access denied")
+
     # Check if student already has accommodation
     result = await session.execute(
         select(StudentHostel).where(StudentHostel.student_id == accommodation_data.student_id)
@@ -480,10 +667,16 @@ async def add_student_accommodation(
     if result.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Student already has hostel accommodation")
 
-    # Enforce room capacity and keep occupancy accurate when a room is assigned up front
+    # Enforce room capacity and keep occupancy accurate when a room is assigned up front.
+    # school_id scoped, without which a school could allocate (and mutate the
+    # occupancy of) another school's room by guessing/reusing its id. Locked
+    # FOR UPDATE so two concurrent requests can't both pass the capacity
+    # check before either commits and over-allocate the room.
     room = None
     if accommodation_data.room_id:
-        room_result = await session.execute(select(Room).where(Room.id == accommodation_data.room_id))
+        room_result = await session.execute(
+            select(Room).where(Room.id == accommodation_data.room_id, Room.school_id == school_id).with_for_update()
+        )
         room = room_result.scalar_one_or_none()
         if not room:
             raise HTTPException(status_code=404, detail="Room not found")
@@ -492,13 +685,12 @@ async def add_student_accommodation(
 
     accommodation = StudentHostel(**accommodation_data.dict(), school_id=school_id)
     session.add(accommodation)
-
-    if room:
-        room.current_occupancy += 1
-        session.add(room)
-
     await session.commit()
     await session.refresh(accommodation)
+
+    if room:
+        await _sync_room_occupancy(session, room.id)
+        await session.commit()
 
     return {**jsonable_encoder(accommodation), "status": accommodation.status.value}
 
@@ -547,7 +739,15 @@ async def get_student_accommodation(
     school_id = current_user.school_id
     if not school_id:
         raise HTTPException(status_code=403, detail="No school context")
-    
+
+    # StudentHostel.student_id stores the roll number (Student.student_id),
+    # not the UUID -- match that when resolving the Student for the
+    # ownership check below.
+    student_result = await session.execute(select(Student).where(Student.student_id == student_id, Student.school_id == school_id))
+    student = student_result.scalar_one_or_none()
+    if not student or not await _has_student_access(session, current_user, student):
+        raise HTTPException(status_code=403, detail="Access denied")
+
     result = await session.execute(
         select(StudentHostel).where(
             and_(StudentHostel.student_id == student_id, StudentHostel.school_id == school_id)
@@ -581,6 +781,13 @@ async def update_student_accommodation(
     if not accommodation:
         raise HTTPException(status_code=404, detail="Accommodation not found")
 
+    student_result = await session.execute(
+        select(Student).where(Student.student_id == accommodation.student_id, Student.school_id == school_id)
+    )
+    student = student_result.scalar_one_or_none()
+    if student and not await _has_student_access(session, current_user, student):
+        raise HTTPException(status_code=403, detail="Access denied")
+
     old_room_id = accommodation.room_id
     old_was_active = accommodation.status == StudentHostelStatus.ACTIVE
 
@@ -593,29 +800,32 @@ async def update_student_accommodation(
     new_room_id = accommodation.room_id
     new_is_active = accommodation.status == StudentHostelStatus.ACTIVE
 
-    # Free the old room's bed if the student moved rooms, or is no longer
-    # an active resident (e.g. graduated/transferred/inactive)
-    if old_room_id and old_was_active and (old_room_id != new_room_id or not new_is_active):
-        old_room_result = await session.execute(select(Room).where(Room.id == old_room_id))
-        old_room = old_room_result.scalar_one_or_none()
-        if old_room and old_room.current_occupancy > 0:
-            old_room.current_occupancy -= 1
-            session.add(old_room)
-
-    # Occupy the new room's bed if a different room was assigned and the student is (still) active
+    # Enforce capacity on the new room before committing anything. school_id
+    # scoped + locked FOR UPDATE for the same reasons as
+    # add_student_accommodation above — new_room_id comes straight from the
+    # client's request body.
     if new_room_id and new_room_id != old_room_id and new_is_active:
-        new_room_result = await session.execute(select(Room).where(Room.id == new_room_id))
+        new_room_result = await session.execute(
+            select(Room).where(Room.id == new_room_id, Room.school_id == school_id).with_for_update()
+        )
         new_room = new_room_result.scalar_one_or_none()
         if not new_room:
             raise HTTPException(status_code=404, detail="Room not found")
         if new_room.current_occupancy >= new_room.capacity:
             raise HTTPException(status_code=400, detail="Room is at full capacity")
-        new_room.current_occupancy += 1
-        session.add(new_room)
 
     session.add(accommodation)
     await session.commit()
     await session.refresh(accommodation)
+
+    # Resync both rooms' occupancy from source (old room freed if the
+    # student moved rooms or is no longer an active resident; new room
+    # occupied if a different room was assigned and the student is active).
+    if old_room_id and old_was_active and (old_room_id != new_room_id or not new_is_active):
+        await _sync_room_occupancy(session, old_room_id)
+    if new_room_id and new_room_id != old_room_id and new_is_active:
+        await _sync_room_occupancy(session, new_room_id)
+    await session.commit()
 
     return {**jsonable_encoder(accommodation), "status": accommodation.status.value}
 
@@ -634,26 +844,51 @@ async def allocate_room_to_student(
     school_id = current_user.school_id
     if not school_id:
         raise HTTPException(status_code=403, detail="No school context")
-    
-    # Check room capacity
-    result = await session.execute(select(Room).where(Room.id == allocation_data.room_id))
+
+    # Verify student exists in this school — previously never checked at all.
+    student_result = await session.execute(
+        select(Student).where(Student.student_id == allocation_data.student_id, Student.school_id == school_id)
+    )
+    student = student_result.scalar_one_or_none()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    if not await _has_student_access(session, current_user, student):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    # A student can only hold one active (not yet deallocated) room
+    # allocation at a time — previously never checked, so repeated calls
+    # could allocate the same student multiple rooms simultaneously, each
+    # only checked against the *target* room's own capacity.
+    existing_result = await session.execute(
+        select(RoomAllocation).where(
+            RoomAllocation.student_id == allocation_data.student_id,
+            RoomAllocation.school_id == school_id,
+            RoomAllocation.deallocation_date.is_(None),
+        )
+    )
+    if existing_result.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="This student already has an active room allocation — deallocate it first")
+
+    # Check room capacity — school_id scoped and locked FOR UPDATE, same
+    # rationale as add_student_accommodation/update_student_accommodation.
+    result = await session.execute(
+        select(Room).where(Room.id == allocation_data.room_id, Room.school_id == school_id).with_for_update()
+    )
     room = result.scalar_one_or_none()
     if not room:
         raise HTTPException(status_code=404, detail="Room not found")
-    
+
     if room.current_occupancy >= room.capacity:
         raise HTTPException(status_code=400, detail="Room is at full capacity")
-    
+
     allocation = RoomAllocation(**allocation_data.dict(), school_id=school_id)
     session.add(allocation)
-    
-    # Update room occupancy
-    room.current_occupancy += 1
-    session.add(room)
-    
     await session.commit()
     await session.refresh(allocation)
-    
+
+    await _sync_room_occupancy(session, room.id)
+    await session.commit()
+
     return jsonable_encoder(allocation)
 
 
@@ -667,7 +902,15 @@ async def get_student_room_allocations(
     school_id = current_user.school_id
     if not school_id:
         raise HTTPException(status_code=403, detail="No school context")
-    
+
+    # RoomAllocation.student_id stores the roll number (Student.student_id),
+    # not the UUID -- match that when resolving the Student for the
+    # ownership check below.
+    student_result = await session.execute(select(Student).where(Student.student_id == student_id, Student.school_id == school_id))
+    student = student_result.scalar_one_or_none()
+    if not student or not await _has_student_access(session, current_user, student):
+        raise HTTPException(status_code=403, detail="Access denied")
+
     result = await session.execute(
         select(RoomAllocation).where(
             and_(
@@ -677,8 +920,48 @@ async def get_student_room_allocations(
         )
     )
     allocations = result.scalars().all()
-    
+
     return [jsonable_encoder(a) for a in allocations]
+
+
+@router.post("/allocation/{allocation_id}/deallocate", response_model=dict)
+async def deallocate_room_from_student(
+    allocation_id: str,
+    current_user: User = Depends(require_roles(UserRole.SUPER_ADMIN, UserRole.SCHOOL_ADMIN)),
+    session: AsyncSession = Depends(get_session)
+):
+    """Free a student's room allocation — until this endpoint existed, a
+    RoomAllocation made via POST /allocation had no reachable way to be
+    released, so every allocation permanently consumed a slot in
+    Room.current_occupancy with no way back through the API. (A correct but
+    uncalled deallocate_room() existed in services/hostel_service.py at the
+    time; that whole dead-code class was later removed, see
+    project_campusio_hostel_service_dead_code_removal_fix.md.)"""
+    school_id = current_user.school_id
+    if not school_id:
+        raise HTTPException(status_code=403, detail="No school context")
+
+    result = await session.execute(
+        select(RoomAllocation).where(
+            and_(RoomAllocation.id == allocation_id, RoomAllocation.school_id == school_id)
+        )
+    )
+    allocation = result.scalar_one_or_none()
+    if not allocation:
+        raise HTTPException(status_code=404, detail="Allocation not found")
+    if allocation.deallocation_date:
+        raise HTTPException(status_code=400, detail="This allocation has already been deallocated")
+
+    room_id = allocation.room_id
+    allocation.deallocation_date = datetime.utcnow().strftime("%Y-%m-%d")
+    session.add(allocation)
+    await session.commit()
+    await session.refresh(allocation)
+
+    await _sync_room_occupancy(session, room_id)
+    await session.commit()
+
+    return jsonable_encoder(allocation)
 
 
 # ============================================================================
@@ -962,6 +1245,40 @@ async def create_hostel_fee(
     if not school_id:
         raise HTTPException(status_code=403, detail="No school context")
 
+    # Verify student exists in this school — previously never checked at
+    # all, unlike routers/transport.py's equivalent create_transport_fee.
+    student_result = await session.execute(
+        select(Student).where(Student.id == fee_data.student_id, Student.school_id == school_id)
+    )
+    student = student_result.scalar_one_or_none()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    if not await _has_student_access(session, current_user, student):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    # If a fee_structure_id is given, it must be a real, same-school
+    # structure, and amount_due is derived from its rate rather than
+    # trusted from the client -- the same "derive from the real record"
+    # fix already applied to routers/fees.py::create_student_fee and
+    # routers/transport.py::create_transport_fee. fee_structure_id is
+    # optional here (unlike a transport fee's mandatory route), so a fee
+    # with none is a deliberately ad-hoc, one-off charge and its
+    # caller-supplied amount_due is left as-is.
+    amount_due = fee_data.amount_due
+    if fee_data.fee_structure_id:
+        structure_result = await session.execute(
+            select(HostelFeeStructure).where(
+                HostelFeeStructure.id == fee_data.fee_structure_id, HostelFeeStructure.school_id == school_id
+            )
+        )
+        structure = structure_result.scalar_one_or_none()
+        if not structure:
+            raise HTTPException(status_code=404, detail="Fee structure not found")
+        amount_due = structure.amount
+
+    if fee_data.discount > amount_due:
+        raise HTTPException(status_code=400, detail="discount cannot exceed the fee amount")
+
     # Double-submit guard: reject an identical fee (same student, hostel,
     # term, type and amount) created in the last 30 seconds, mirroring the
     # fee-payment guard in routers/fees.py::record_payment.
@@ -974,7 +1291,7 @@ async def create_hostel_fee(
                 HostelFee.hostel_id == fee_data.hostel_id,
                 HostelFee.academic_term_id == fee_data.academic_term_id,
                 HostelFee.fee_type == fee_data.fee_type,
-                HostelFee.amount_due == fee_data.amount_due,
+                HostelFee.amount_due == amount_due,
                 HostelFee.created_at >= dupe_cutoff,
             )
         )
@@ -982,7 +1299,13 @@ async def create_hostel_fee(
     if dupe_result.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="An identical hostel fee was just created — avoid double-submitting")
 
-    fee = HostelFee(**fee_data.dict(), school_id=school_id)
+    fee_dict = fee_data.dict()
+    fee_dict['amount_due'] = amount_due
+    fee = HostelFee(**fee_dict, school_id=school_id)
+    # Same formula as update_hostel_fee's auto-calc: a fee created fully
+    # covered by its own discount (e.g. a scholarship waiver) must not sit
+    # marked unpaid until some unrelated later update happens to touch it.
+    fee.is_paid = (fee.amount_due - fee.amount_paid - fee.discount) <= 0
     session.add(fee)
     await session.commit()
     await session.refresh(fee)
@@ -994,22 +1317,32 @@ async def create_hostel_fee(
 async def get_hostel_fees(
     hostel_id: Optional[str] = None,
     is_paid: Optional[bool] = None,
+    needs_gl_reconciliation: Optional[bool] = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session)
 ):
-    """Get hostel fees, optionally filtered by hostel"""
+    """Get hostel fees, optionally filtered by hostel
+
+    needs_gl_reconciliation=true surfaces fees that received a payment but
+    have no gl_journal_entry_id -- GL posting is best-effort (see
+    _post_hostel_fee_to_gl) and its failures were previously only logged,
+    with no reconciliation job covering hostel fees at all, so a failed
+    post was otherwise permanently invisible to admins.
+    """
     school_id = current_user.school_id
     if not school_id:
         raise HTTPException(status_code=403, detail="No school context")
-    
+
     query = select(HostelFee).where(HostelFee.school_id == school_id)
-    
+
     if hostel_id:
         query = query.where(HostelFee.hostel_id == hostel_id)
     if is_paid is not None:
         query = query.where(HostelFee.is_paid == is_paid)
+    if needs_gl_reconciliation:
+        query = query.where(HostelFee.amount_paid > 0, HostelFee.gl_journal_entry_id.is_(None))
     
     query = query.offset(skip).limit(limit)
     result = await session.execute(query)
@@ -1034,7 +1367,14 @@ async def get_student_hostel_fees(
     school_id = current_user.school_id
     if not school_id:
         raise HTTPException(status_code=403, detail="No school context")
-    
+
+    # Unlike StudentHostel/RoomAllocation, HostelFee.student_id stores the
+    # real Student UUID (confirmed against live data), matching Student.id.
+    student_result = await session.execute(select(Student).where(Student.id == student_id, Student.school_id == school_id))
+    student = student_result.scalar_one_or_none()
+    if not student or not await _has_student_access(session, current_user, student):
+        raise HTTPException(status_code=403, detail="Access denied")
+
     query = select(HostelFee).where(
         and_(
             HostelFee.student_id == student_id,
@@ -1136,6 +1476,11 @@ async def update_hostel_fee(
             )
             if journal_entry_id:
                 logger.info(f"Created journal entry {journal_entry_id} for hostel fee payment {fee_id}")
+                fee.gl_journal_entry_id = journal_entry_id
+                fee.gl_posted_date = datetime.utcnow().isoformat().split('T')[0]
+                session.add(fee)
+                await session.commit()
+                await session.refresh(fee)
             else:
                 logger.warning(f"GL posting returned None for hostel fee payment {fee_id} (GL accounts may not be configured)")
         except Exception as e:
@@ -1200,6 +1545,17 @@ async def get_hostel_fees_summary(
 # MAINTENANCE
 # ============================================================================
 
+async def _validate_facilities_links(session: AsyncSession, contractor_id: Optional[str], work_order_id: Optional[str], school_id: str) -> None:
+    if contractor_id:
+        result = await session.execute(select(FacilityContractor).where(FacilityContractor.id == contractor_id, FacilityContractor.school_id == school_id))
+        if not result.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Contractor not found in this school")
+    if work_order_id:
+        result = await session.execute(select(FacilityWorkOrder).where(FacilityWorkOrder.id == work_order_id, FacilityWorkOrder.school_id == school_id))
+        if not result.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Work order not found in this school")
+
+
 @router.post("/maintenance", response_model=dict)
 async def record_maintenance(
     maintenance_data: HostelMaintenanceCreate,
@@ -1210,7 +1566,20 @@ async def record_maintenance(
     school_id = current_user.school_id
     if not school_id:
         raise HTTPException(status_code=403, detail="No school context")
-    
+
+    # hostel_id/room_id were previously never validated against school_id at
+    # all — only contractor_id/work_order_id were checked via
+    # _validate_facilities_links.
+    hostel_result = await session.execute(select(Hostel).where(Hostel.id == maintenance_data.hostel_id, Hostel.school_id == school_id))
+    if not hostel_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Hostel not found")
+    if maintenance_data.room_id:
+        room_result = await session.execute(select(Room).where(Room.id == maintenance_data.room_id, Room.school_id == school_id))
+        if not room_result.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="Room not found")
+
+    await _validate_facilities_links(session, maintenance_data.contractor_id, maintenance_data.work_order_id, school_id)
+
     maintenance = HostelMaintenance(**maintenance_data.dict(), school_id=school_id)
     session.add(maintenance)
     await session.commit()
@@ -1349,8 +1718,38 @@ async def get_hostel_visitors(
     query = query.offset(skip).limit(limit)
     result = await session.execute(query)
     records = result.scalars().all()
-    
+
     return [jsonable_encoder(r) for r in records]
+
+
+@router.put("/visitors/{visitor_id}", response_model=dict)
+async def update_visitor(
+    visitor_id: str,
+    visitor_data: HostelVisitorUpdate,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session)
+):
+    """Update a hostel visitor record — e.g. recording check-out time or
+    correcting entry details, without the delete+recreate the frontend used
+    to have to do in the absence of this endpoint."""
+    school_id = current_user.school_id
+    if not school_id:
+        raise HTTPException(status_code=403, detail="No school context")
+
+    result = await session.execute(
+        select(HostelVisitor).where(and_(HostelVisitor.id == visitor_id, HostelVisitor.school_id == school_id))
+    )
+    visitor = result.scalar_one_or_none()
+    if not visitor:
+        raise HTTPException(status_code=404, detail="Visitor record not found")
+
+    for key, value in visitor_data.dict(exclude_unset=True).items():
+        setattr(visitor, key, value)
+
+    session.add(visitor)
+    await session.commit()
+    await session.refresh(visitor)
+    return jsonable_encoder(visitor)
 
 
 # ============================================================================
@@ -1495,15 +1894,14 @@ async def delete_accommodation(
     # Free the room's bed before removing the accommodation record (only if
     # it was actively occupying one — inactive/graduated/transferred records
     # already had their bed freed when their status changed)
-    if accommodation.room_id and accommodation.status == StudentHostelStatus.ACTIVE:
-        room_result = await session.execute(select(Room).where(Room.id == accommodation.room_id))
-        room = room_result.scalar_one_or_none()
-        if room and room.current_occupancy > 0:
-            room.current_occupancy -= 1
-            session.add(room)
+    room_id_to_sync = accommodation.room_id if accommodation.status == StudentHostelStatus.ACTIVE else None
 
     await session.delete(accommodation)
     await session.commit()
+
+    if room_id_to_sync:
+        await _sync_room_occupancy(session, room_id_to_sync)
+        await session.commit()
 
     return {"message": "Accommodation deleted successfully", "id": accommodation_id}
 
@@ -1527,10 +1925,28 @@ async def delete_fee(
     fee = result.scalar_one_or_none()
     if not fee:
         raise HTTPException(status_code=404, detail="Fee not found")
-    
+
+    # Reverse the GL journal entry this fee was posted under (if any) before
+    # deleting it — otherwise the ledger permanently overstates cash/revenue
+    # for a fee that no longer even exists in fee records. Best-effort: a GL
+    # problem here shouldn't block the delete itself, same trade-off as
+    # routers/fees.py::void_payment's identical reversal-before-void step.
+    if fee.gl_journal_entry_id:
+        try:
+            from services.journal_entry_service import JournalEntryService
+            journal_service = JournalEntryService(session)
+            await journal_service.reverse_entry(
+                school_id=school_id,
+                entry_id=fee.gl_journal_entry_id,
+                reversed_by=current_user.id,
+                reversal_reason=f"Hostel fee {fee_id} deleted",
+            )
+        except Exception as e:
+            logger.error(f"Error reversing journal entry {fee.gl_journal_entry_id} for deleted hostel fee {fee_id}: {str(e)}")
+
     await session.delete(fee)
     await session.commit()
-    
+
     return {"message": "Fee deleted successfully", "id": fee_id}
 
 
@@ -1552,10 +1968,11 @@ async def update_maintenance(
         )
     )
     maintenance = result.scalar_one_or_none()
-    
+
     if not maintenance:
         raise HTTPException(status_code=404, detail="Maintenance record not found")
-    
+    await _validate_facilities_links(session, update_data.contractor_id, update_data.work_order_id, school_id)
+
     # Update fields
     update_data_dict = update_data.dict(exclude_unset=True)
     for key, value in update_data_dict.items():
@@ -1777,8 +2194,21 @@ async def _post_hostel_fee_to_gl(
         
         service = JournalEntryService(session)
         entry = await service.create_entry(school_id, journal_entry, created_by)
-        
-        return entry.id if entry else None
+        if not entry:
+            return None
+
+        # create_entry only ever leaves a new entry in DRAFT status -- GL
+        # account balances aren't touched, and the entry stays invisible to
+        # the trial balance/any POSTED-only report until this runs. Without
+        # it, every hostel fee payment's journal entry was permanently
+        # stuck in DRAFT (unlike routers/transport.py's equivalent, which
+        # already calls post_entry after create_entry).
+        posted = await service.post_entry(
+            school_id=school_id, entry_id=entry.id, posted_by=created_by,
+            approval_notes="Auto-posted from hostel fee payment",
+        )
+
+        return posted.id if posted else entry.id
         
     except Exception as e:
         import traceback

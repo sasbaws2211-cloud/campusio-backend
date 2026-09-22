@@ -16,8 +16,13 @@ from datetime import datetime
 
 from services.retained_earnings_service import RetainedEarningsService, RetainedEarningsError
 from dependencies import get_current_school_id
-from auth import get_current_user 
+from auth import get_current_user, require_roles
 from database import get_session
+from models.user import User, UserRole
+
+# Period close and opening-balance rollover are irreversible GL operations —
+# same role gate as journal.py's posting/reversal endpoints.
+FINANCE_ADMIN_ROLES = (UserRole.SUPER_ADMIN, UserRole.SCHOOL_ADMIN, UserRole.HR)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/retained-earnings", tags=["Retained Earnings"])
@@ -66,7 +71,7 @@ async def get_net_income(
 @router.post("/close-period/{period_id}", response_model=dict)
 async def close_fiscal_period(
     period_id: str,
-    current_user: dict = Depends(get_current_user),
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
     request: Request = None,
@@ -96,18 +101,20 @@ async def close_fiscal_period(
         service = RetainedEarningsService(session)
         
         ip_address = request.client.host if request else None
-        user_role = current_user.get("role", "finance")
-        
+        user_role = current_user.role.value if current_user.role else "finance"
+        user_name = f"{current_user.first_name} {current_user.last_name}"
+
         result = await service.close_period(
             school_id=school_id,
             period_id=period_id,
-            closed_by=current_user.get("id", "unknown"),
+            closed_by=current_user.id,
             ip_address=ip_address,
             user_role=user_role,
+            user_name=user_name,
         )
-        
+
         logger.info(
-            f"Period {period_id} closed by {current_user.get('id')} "
+            f"Period {period_id} closed by {current_user.id} "
             f"(net income: {result['net_income']:.2f})"
         )
         
@@ -125,7 +132,7 @@ async def close_fiscal_period(
 @router.post("/set-opening-balances", response_model=dict)
 async def set_opening_balances(
     body: SetOpeningBalancesRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -156,12 +163,14 @@ async def set_opening_balances(
             school_id=school_id,
             from_period_id=from_period_id,
             to_period_id=to_period_id,
-            created_by=current_user.get("id", "unknown"),
+            created_by=current_user.id,
+            user_role=current_user.role.value if current_user.role else "finance",
+            user_name=f"{current_user.first_name} {current_user.last_name}",
         )
-        
+
         logger.info(
             f"Opening balances set for period {to_period_id} "
-            f"({result['accounts_updated']} accounts) by {current_user.get('id')}"
+            f"({result['accounts_updated']} accounts) by {current_user.id}"
         )
         
         return result
@@ -246,11 +255,14 @@ async def get_retained_earnings_balance(
     try:
         service = RetainedEarningsService(session)
         balance = await service.get_retained_earnings_balance(school_id)
-        
+        account = await service.coa_service.get_system_account(
+            school_id=school_id, system_role="retained_earnings", fallback_code="3100",
+        )
+
         return {
             "school_id": school_id,
-            "account_code": "3100",
-            "account_name": "Retained Earnings",
+            "account_code": account.account_code if account else "3100",
+            "account_name": account.account_name if account else "Retained Earnings",
             "balance": balance,
             "as_of": datetime.utcnow().isoformat(),
         }

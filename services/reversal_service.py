@@ -8,6 +8,7 @@ Handles complex reversal scenarios:
 """
 import logging
 from typing import Optional, List, Dict, Any, Tuple
+from decimal import Decimal
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select, and_, func
 from datetime import datetime
@@ -69,12 +70,17 @@ class ReversalService:
         reversal_notes: Optional[str] = None,
         ip_address: Optional[str] = None,
         user_role: str = "finance",
+        user_name: str = "Unknown",
     ) -> Tuple[JournalEntry, JournalEntry]:
         """Reverse an entire posted journal entry
-        
-        Creates a complete contra-entry with opposite debits/credits
-        for all line items.
-        
+
+        Delegates to JournalEntryService.reverse_entry — the same routine
+        journal.py's own /reverse endpoint uses — instead of re-implementing
+        full-entry reversal here. The two copies previously drifted: this one
+        wrote to a `reversal_date` attribute that doesn't exist on the model
+        (JournalEntry only has `reversed_date`), so every reversal made
+        through this endpoint silently failed to persist that field.
+
         Args:
             school_id: School identifier
             entry_id: Entry ID to reverse
@@ -83,111 +89,49 @@ class ReversalService:
             reversal_notes: Optional additional notes
             ip_address: IP address for audit
             user_role: User role for audit
-            
+            user_name: Display name of the user, for the audit log
+
         Returns:
             Tuple of (original_entry, reversal_entry)
-            
+
         Raises:
             ReversalError: If reversal cannot be completed
         """
         try:
-            # Get original entry
-            result = await self.session.execute(
-                select(JournalEntry).where(
-                    and_(
-                        JournalEntry.school_id == school_id,
-                        JournalEntry.id == entry_id
-                    )
-                )
-            )
-            original_entry = result.scalar_one_or_none()
-            
-            if not original_entry:
-                raise ReversalError(f"Entry {entry_id} not found")
-            
-            if original_entry.posting_status != PostingStatus.POSTED:
-                raise ReversalError(
-                    f"Cannot reverse entry with status {original_entry.posting_status.value}. "
-                    f"Only POSTED entries can be reversed."
-                )
-            
-            if original_entry.reversal_entry_id:
-                raise ReversalError(
-                    f"Entry has already been reversed (reversal ID: {original_entry.reversal_entry_id})"
-                )
-            
-            # Get line items
-            result = await self.session.execute(
-                select(JournalLineItem).where(
-                    JournalLineItem.journal_entry_id == entry_id
-                )
-            )
-            line_items = result.scalars().all()
-            
-            # Build reversal entry (swap debits/credits for all line items)
-            reversal_lines = []
-            for li in line_items:
-                reversal_lines.append(
-                    JournalLineItemCreate(
-                        gl_account_id=li.gl_account_id,
-                        debit_amount=li.credit_amount,  # Swap
-                        credit_amount=li.debit_amount,   # Swap
-                        description=f"Reversal: {li.description}" if li.description else "Reversal",
-                        line_number=li.line_number,
-                    )
-                )
-            
-            # Create reversal entry
-            reversal_entry_data = JournalEntryCreate(
-                entry_date=datetime.utcnow(),
-                reference_type=ReferenceType.ADJUSTMENT,
-                reference_id=entry_id,
-                description=f"Full Reversal - {original_entry.reference_type.value}: {reversal_reason}",
-                line_items=reversal_lines,
-                notes=reversal_notes or "",
-            )
-            
-            # Create and post reversal
-            reversal_entry = await self.journal_service.create_entry(
+            original_entry, reversal_entry = await self.journal_service.reverse_entry(
                 school_id=school_id,
-                entry_data=reversal_entry_data,
-                created_by=reversed_by,
+                entry_id=entry_id,
+                reversed_by=reversed_by,
+                reversal_reason=reversal_reason,
+                reversal_notes=reversal_notes,
             )
-            
-            await self.journal_service.post_entry(
-                school_id=school_id,
-                entry_id=reversal_entry.id,
-                posted_by=reversed_by,
-                approval_notes=f"Reversal of {entry_id}: {reversal_reason}",
-                ip_address=ip_address,
-                user_role=user_role,
-            )
-            
-            # Update original entry
-            original_entry.posting_status = PostingStatus.REVERSED
-            original_entry.reversal_entry_id = reversal_entry.id
-            original_entry.reversal_date = datetime.utcnow()
-            original_entry.reversed_by = reversed_by
-            original_entry.reversal_reason = reversal_reason
-            original_entry.updated_at = datetime.utcnow()
-            
-            self.session.add(original_entry)
-            await self.session.commit()
-            
-            logger.info(
-                f"Fully reversed entry {entry_id} with reversal {reversal_entry.id} "
-                f"(reason: {reversal_reason}, user: {reversed_by})"
-            )
-            
-            return (original_entry, reversal_entry)
-            
-        except ReversalError:
-            await self.session.rollback()
-            raise
+        except JournalEntryError as e:
+            raise ReversalError(str(e))
         except Exception as e:
-            await self.session.rollback()
             logger.error(f"Error reversing entry {entry_id}: {str(e)}")
             raise ReversalError(f"Failed to reverse entry: {str(e)}")
+
+        try:
+            await self.audit_service.log_action(
+                school_id=school_id,
+                entity_type=AuditEntityType.JOURNAL_ENTRY,
+                entity_id=entry_id,
+                action=AuditActionType.ENTRY_REVERSED,
+                user_id=reversed_by,
+                user_name=user_name,
+                user_role=user_role,
+                new_values={"reversal_reason": reversal_reason, "reversal_entry_id": reversal_entry.id},
+                ip_address=ip_address,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to write GL audit log for reversal of {entry_id}: {e}")
+
+        logger.info(
+            f"Fully reversed entry {entry_id} with reversal {reversal_entry.id} "
+            f"(reason: {reversal_reason}, user: {reversed_by})"
+        )
+
+        return (original_entry, reversal_entry)
     
     # ==================== Partial Reversal ====================
     
@@ -201,6 +145,7 @@ class ReversalService:
         reversal_notes: Optional[str] = None,
         ip_address: Optional[str] = None,
         user_role: str = "finance",
+        user_name: str = "Unknown",
     ) -> Tuple[JournalEntry, JournalEntry]:
         """Reverse specific line items from a posted entry
         
@@ -240,7 +185,12 @@ class ReversalService:
             
             if original_entry.posting_status != PostingStatus.POSTED:
                 raise ReversalError(f"Can only partially reverse POSTED entries")
-            
+
+            try:
+                await self.journal_service.assert_reversal_allowed(school_id, original_entry, reversed_by)
+            except JournalEntryError as e:
+                raise ReversalError(str(e))
+
             # Get line items
             result = await self.session.execute(
                 select(JournalLineItem).where(
@@ -257,8 +207,8 @@ class ReversalService:
             
             # Build partial reversal (swap only selected line items)
             reversal_lines = []
-            total_debit = 0.0
-            total_credit = 0.0
+            total_debit = Decimal("0")
+            total_credit = Decimal("0")
             
             for li in all_line_items:
                 if li.line_number in line_numbers:
@@ -276,7 +226,7 @@ class ReversalService:
                     total_credit += li.debit_amount
             
             # Validate partial reversal is balanced
-            if abs(total_debit - total_credit) > 0.01:
+            if abs(total_debit - total_credit) > Decimal("0.01"):
                 raise ReversalError(
                     f"Selected line items do not balance. "
                     f"Debits: {total_debit:.2f}, Credits: {total_credit:.2f}"
@@ -307,12 +257,31 @@ class ReversalService:
                 ip_address=ip_address,
                 user_role=user_role,
             )
-            
+
+            try:
+                await self.audit_service.log_action(
+                    school_id=school_id,
+                    entity_type=AuditEntityType.JOURNAL_ENTRY,
+                    entity_id=entry_id,
+                    action=AuditActionType.ENTRY_REVERSED,
+                    user_id=reversed_by,
+                    user_name=user_name,
+                    user_role=user_role,
+                    new_values={
+                        "reversal_reason": reversal_reason,
+                        "reversal_entry_id": reversal_entry.id,
+                        "lines_reversed": line_numbers,
+                    },
+                    ip_address=ip_address,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to write GL audit log for partial reversal of {entry_id}: {e}")
+
             logger.info(
                 f"Partially reversed entry {entry_id} (lines: {line_numbers}) "
                 f"with reversal {reversal_entry.id} (reason: {reversal_reason})"
             )
-            
+
             return (original_entry, reversal_entry)
             
         except ReversalError:
@@ -335,6 +304,7 @@ class ReversalService:
         reversal_notes: Optional[str] = None,
         ip_address: Optional[str] = None,
         user_role: str = "finance",
+        user_name: str = "Unknown",
     ) -> Tuple[JournalEntry, JournalEntry]:
         """Reverse postings to specific GL accounts only
         
@@ -368,7 +338,12 @@ class ReversalService:
             
             if not original_entry:
                 raise ReversalError(f"Entry {entry_id} not found")
-            
+
+            try:
+                await self.journal_service.assert_reversal_allowed(school_id, original_entry, reversed_by)
+            except JournalEntryError as e:
+                raise ReversalError(str(e))
+
             # Get line items for specified accounts
             result = await self.session.execute(
                 select(JournalLineItem).where(
@@ -421,12 +396,31 @@ class ReversalService:
                 ip_address=ip_address,
                 user_role=user_role,
             )
-            
+
+            try:
+                await self.audit_service.log_action(
+                    school_id=school_id,
+                    entity_type=AuditEntityType.JOURNAL_ENTRY,
+                    entity_id=entry_id,
+                    action=AuditActionType.ENTRY_REVERSED,
+                    user_id=reversed_by,
+                    user_name=user_name,
+                    user_role=user_role,
+                    new_values={
+                        "reversal_reason": reversal_reason,
+                        "reversal_entry_id": reversal_entry.id,
+                        "accounts_reversed": account_ids,
+                    },
+                    ip_address=ip_address,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to write GL audit log for account reversal of {entry_id}: {e}")
+
             logger.info(
                 f"Reversed accounts {account_ids} in entry {entry_id} "
                 f"with reversal {reversal_entry.id}"
             )
-            
+
             return (original_entry, reversal_entry)
             
         except ReversalError:
@@ -526,18 +520,18 @@ class ReversalService:
                     and_(
                         JournalEntry.school_id == school_id,
                         JournalEntry.posting_status == PostingStatus.REVERSED,
-                        JournalEntry.reversal_date >= start_date,
-                        JournalEntry.reversal_date <= end_date,
+                        JournalEntry.reversed_date >= start_date,
+                        JournalEntry.reversed_date <= end_date,
                     )
-                ).order_by(JournalEntry.reversal_date.desc())
+                ).order_by(JournalEntry.reversed_date.desc())
             )
             reversed_entries = result.scalars().all()
-            
+
             return [
                 {
                     "original_id": entry.id,
                     "reversal_id": entry.reversal_entry_id,
-                    "reversal_date": entry.reversal_date,
+                    "reversal_date": entry.reversed_date,
                     "reversed_by": entry.reversed_by,
                     "reversal_reason": entry.reversal_reason,
                     "amount": float(entry.total_debit),
@@ -573,9 +567,9 @@ class ReversalService:
             )
             
             if start_date:
-                query = query.where(JournalEntry.reversal_date >= start_date)
+                query = query.where(JournalEntry.reversed_date >= start_date)
             if end_date:
-                query = query.where(JournalEntry.reversal_date <= end_date)
+                query = query.where(JournalEntry.reversed_date <= end_date)
             
             result = await self.session.execute(query)
             reversed_entries = result.scalars().all()

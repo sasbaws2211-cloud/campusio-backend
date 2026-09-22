@@ -1,6 +1,8 @@
 """Chart of Accounts Service - Business logic for GL account management"""
 import logging
 from typing import Optional, List, Dict, Any
+from decimal import Decimal
+from sqlalchemy import update as sql_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select, and_, or_
 from datetime import datetime
@@ -97,6 +99,7 @@ class CoaService:
             description=account_data.description,
             normal_balance=normal_balance,
             parent_account_id=account_data.parent_account_id,
+            system_role=account_data.system_role,
             created_by=created_by,
             is_active=True,
         )
@@ -174,6 +177,51 @@ class CoaService:
             logger.error(f"Error fetching account by code {account_code}: {str(e)}")
             return None
     
+    async def get_system_account(
+        self,
+        school_id: str,
+        system_role: str,
+        fallback_code: Optional[str] = None,
+    ) -> Optional[GLAccount]:
+        """Look up a well-known account by its system role (e.g.
+        "default_cash_account", "retained_earnings") instead of a hardcoded
+        account_code.
+
+        Falls back to `fallback_code` when no account is tagged with that
+        role yet — e.g. schools seeded before system_role existed — so this
+        stays backward-compatible while letting a school reassign which
+        account fills a system role without breaking expense posting or
+        period close on a renamed/deleted hardcoded code.
+
+        Args:
+            school_id: School identifier
+            system_role: Role to look up (e.g. "default_cash_account")
+            fallback_code: Account code to fall back to if no account has
+                this system_role set
+
+        Returns:
+            GLAccount if found (by role or fallback code), else None
+        """
+        try:
+            result = await self.session.execute(
+                select(GLAccount).where(
+                    and_(
+                        GLAccount.school_id == school_id,
+                        GLAccount.system_role == system_role,
+                        GLAccount.is_active == True,
+                    )
+                )
+            )
+            account = result.scalar_one_or_none()
+            if account:
+                return account
+        except Exception as e:
+            logger.error(f"Error looking up system account '{system_role}' for school {school_id}: {str(e)}")
+
+        if fallback_code:
+            return await self._get_account_by_code(school_id, fallback_code)
+        return None
+
     async def get_all_accounts(
         self,
         school_id: str,
@@ -349,7 +397,19 @@ class CoaService:
         account = await self.get_account_by_id(school_id, account_id)
         if not account:
             return None
-        
+
+        # Every report (Trial Balance, Balance Sheet, P&L via
+        # services/reports_service.py::_active_accounts) filters to
+        # is_active == True — deactivating an account with a nonzero
+        # balance would silently drop that balance from every financial
+        # statement with no error anywhere, breaking Assets == Liabilities
+        # + Equity from the very next report run.
+        if account.current_balance != 0:
+            raise CoaServiceError(
+                f"Cannot deactivate account '{account.account_code}' — it has a nonzero balance "
+                f"({account.current_balance}). Transfer or zero out the balance first."
+            )
+
         account.is_active = False
         account.updated_at = datetime.utcnow()
         
@@ -444,27 +504,35 @@ class CoaService:
         self,
         school_id: str,
         account_id: str,
-        debit_amount: float = 0.0,
-        credit_amount: float = 0.0,
+        debit_amount: Decimal = Decimal("0"),
+        credit_amount: Decimal = Decimal("0"),
+        commit: bool = True,
     ) -> Optional[GLAccount]:
         """Update GL account balance after posting a transaction
-        
+
         This is CRITICAL for performance and accuracy. Balances are denormalized
         and cached in the GL account record. This method is called during:
         - Journal entry posting
         - Expense posting
         - Period close procedures
-        
+
         Balance calculation:
         - For DEBIT normal accounts (assets, expenses): DR+ / CR-
         - For CREDIT normal accounts (liabilities, revenue, equity): CR+ / DR-
-        
+
+        The balance is updated via an atomic `SET current_balance = current_balance
+        + delta` rather than a Python read-modify-write, so two concurrent postings
+        to the same account can't race and silently lose one update.
+
         Args:
             school_id: School identifier
             account_id: Account ID to update
             debit_amount: Debit amount to add to balance
             credit_amount: Credit amount to add to balance
-            
+            commit: If False, stage the change (flush only) and let the caller
+                commit — used by multi-line postings so the whole entry posts
+                as one transaction instead of one commit per line item.
+
         Returns:
             Updated GLAccount, or None if not found
         """
@@ -473,7 +541,7 @@ class CoaService:
             if not account:
                 logger.warning(f"Cannot update balance for non-existent account {account_id}")
                 return None
-            
+
             # Calculate balance change based on normal balance
             if account.normal_balance == "debit":
                 # Debit normal: DR increases, CR decreases
@@ -481,25 +549,55 @@ class CoaService:
             else:
                 # Credit normal: CR increases, DR decreases
                 balance_change = credit_amount - debit_amount
-            
-            # Update balance
-            account.current_balance += balance_change
-            account.last_balance_update = datetime.utcnow()
-            account.updated_at = datetime.utcnow()
-            
-            self.session.add(account)
-            await self.session.commit()
-            await self.session.refresh(account)
-            
+
+            now = datetime.utcnow()
+            await self.session.execute(
+                sql_update(GLAccount)
+                .where(
+                    and_(
+                        GLAccount.school_id == school_id,
+                        GLAccount.id == account_id,
+                    )
+                )
+                .values(
+                    current_balance=GLAccount.current_balance + balance_change,
+                    last_balance_update=now,
+                    updated_at=now,
+                )
+                # Without this, SQLAlchemy's default synchronize_session="auto"
+                # evaluates the arithmetic SET clause itself and bumps the
+                # already-loaded `account` object's current_balance in-memory
+                # to match — then the manual `account.current_balance +=
+                # balance_change` below double-applies the same delta.
+                .execution_options(synchronize_session=False)
+            )
+
+            if commit:
+                await self.session.commit()
+                await self.session.refresh(account)
+            else:
+                await self.session.flush()
+                # Reflect the change on the in-memory object without a round
+                # trip — the caller owns the commit/refresh at this point.
+                account.current_balance += balance_change
+                account.last_balance_update = now
+                account.updated_at = now
+
             logger.debug(
                 f"Updated balance for account {account.account_code}: "
                 f"DR {debit_amount} CR {credit_amount} → Balance {account.current_balance}"
             )
-            
+
             return account
         except Exception as e:
             logger.error(f"Error updating account balance for {account_id}: {str(e)}")
-            return None
+            if commit:
+                return None
+            # In the deferred-commit path, the caller (post_entry) is
+            # responsible for rolling back and surfacing the failure —
+            # swallowing it here would let posting continue with a
+            # partially-staged transaction.
+            raise
     
     async def recalculate_account_balance(
         self,
@@ -546,15 +644,20 @@ class CoaService:
                     and_(
                         JournalLineItem.school_id == school_id,
                         JournalLineItem.gl_account_id == account_id,
-                        JournalEntry.posting_status == PostingStatus.POSTED,
+                        # POSTED *and* REVERSED, not POSTED alone: reversing an
+                        # entry flips its own status to REVERSED, so a
+                        # POSTED-only filter would drop the original posting's
+                        # line items while still counting the contra-entry's —
+                        # netting to the reversal amount instead of zero.
+                        JournalEntry.posting_status.in_([PostingStatus.POSTED, PostingStatus.REVERSED]),
                     )
                 )
             )
             
             row = result.first()
-            total_debits = float(row[0] or 0.0)
-            total_credits = float(row[1] or 0.0)
-            
+            total_debits = Decimal(str(row[0])) if row[0] is not None else Decimal("0")
+            total_credits = Decimal(str(row[1])) if row[1] is not None else Decimal("0")
+
             # Calculate balance based on normal balance
             if account.normal_balance == "debit":
                 account.current_balance = total_debits - total_credits
@@ -601,24 +704,24 @@ class CoaService:
                 "total_accounts": len(all_accounts),
                 "recalculated": 0,
                 "errors": 0,
-                "total_balance": 0.0,
+                "total_balance": Decimal("0"),
                 "by_type": {},
             }
-            
+
             for account in all_accounts:
                 result = await self.recalculate_account_balance(
                     school_id, account.id, from_journal_entries=True
                 )
-                
+
                 if result:
                     summary["recalculated"] += 1
                     summary["total_balance"] += result.current_balance
-                    
+
                     account_type = result.account_type.value
                     if account_type not in summary["by_type"]:
                         summary["by_type"][account_type] = {
                             "count": 0,
-                            "total_balance": 0.0
+                            "total_balance": Decimal("0"),
                         }
                     summary["by_type"][account_type]["count"] += 1
                     summary["by_type"][account_type]["total_balance"] += result.current_balance
@@ -640,7 +743,7 @@ class CoaService:
         school_id: str,
         account_id: str,
         use_cached: bool = True,
-    ) -> Optional[float]:
+    ) -> Optional[Decimal]:
         """Get current balance of a GL account
         
         Uses cached balance by default (performance). Pass use_cached=False
@@ -671,28 +774,32 @@ class CoaService:
         self,
         school_id: str,
         account_id: str,
-        opening_balance: float,
+        opening_balance: Decimal,
     ) -> Optional[GLAccount]:
         """Set opening balance for GL account (for period tracking)
-        
+
         Opening balance is set at the start of each period and used for:
         - Period comparisons (opening → closing)
         - Year-to-date calculations
         - Period-over-period analysis
-        
+
         Args:
             school_id: School identifier
             account_id: Account ID
             opening_balance: Balance at period start
-            
+
         Returns:
             Updated GLAccount, or None if not found
         """
         account = await self.get_account_by_id(school_id, account_id)
         if not account:
             return None
-        
-        account.opening_balance = opening_balance
+
+        # Accept a plain float too (some callers still pass one) without
+        # losing precision the way `Decimal(float)` would.
+        account.opening_balance = (
+            opening_balance if isinstance(opening_balance, Decimal) else Decimal(str(opening_balance))
+        )
         account.updated_at = datetime.utcnow()
         
         self.session.add(account)
@@ -731,8 +838,12 @@ class CoaService:
         account = await self.get_account_by_id(school_id, account_id)
         if not account:
             return None
-        
-        account.bank_reconciled_balance = reconciled_balance
+
+        # The bank-reconciliation subsystem still deals in float — convert
+        # at this boundary (via str, not a direct Decimal(float) cast, to
+        # avoid inheriting the float's binary-rounding noise) rather than
+        # widening Decimal through that whole subsystem.
+        account.bank_reconciled_balance = Decimal(str(reconciled_balance))
         account.bank_reconciliation_date = reconciliation_date
         account.reconciliation_notes = notes
         account.updated_at = datetime.utcnow()

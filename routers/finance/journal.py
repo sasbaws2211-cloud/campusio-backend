@@ -41,15 +41,19 @@ from models.finance import (
     ReferenceType,
 )
 from models.finance.gl_audit_log import AuditActionType, AuditEntityType
-from models.user import User, UserRole
+from models.user import User
 from database import get_session
-from auth import get_current_user, require_roles
+from auth import get_current_user, require_permission
 from services.journal_entry_service import JournalEntryService, JournalEntryError, JournalEntryValidationError
 from services.gl_audit_log_service import GLAuditLogService
+from services.plan_gating import require_plan_feature
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/journal-entries", tags=["Finance - Journal Entries"])
+router = APIRouter(
+    prefix="/journal-entries", tags=["Finance - Journal Entries"],
+    dependencies=[Depends(require_plan_feature("finance_advanced"))],
+)
 
 
 async def _log_gl_audit(
@@ -83,11 +87,7 @@ async def _log_gl_audit(
 @router.post("", response_model=JournalEntryResponse, status_code=status.HTTP_201_CREATED)
 async def create_entry(
     entry_data: JournalEntryCreate,
-    current_user: User = Depends(require_roles(
-        UserRole.SUPER_ADMIN,
-        UserRole.SCHOOL_ADMIN,
-        UserRole.HR,
-    )),
+    current_user: User = Depends(require_permission("finance.journal.create")),
     session: AsyncSession = Depends(get_session),
 ):
     """Create a new journal entry (in DRAFT status)
@@ -376,11 +376,7 @@ async def get_entries_by_reference(
 async def update_entry(
     entry_id: str,
     update_data: JournalEntryUpdate,
-    current_user: User = Depends(require_roles(
-        UserRole.SUPER_ADMIN,
-        UserRole.SCHOOL_ADMIN,
-        UserRole.HR,
-    )),
+    current_user: User = Depends(require_permission("finance.journal.update")),
     session: AsyncSession = Depends(get_session),
 ):
     """Update a journal entry (only DRAFT entries can be updated)
@@ -467,11 +463,7 @@ async def update_entry(
 @router.delete("/{entry_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_entry(
     entry_id: str,
-    current_user: User = Depends(require_roles(
-        UserRole.SUPER_ADMIN,
-        UserRole.SCHOOL_ADMIN,
-        UserRole.HR,
-    )),
+    current_user: User = Depends(require_permission("finance.journal.delete")),
     session: AsyncSession = Depends(get_session),
 ):
     """Delete a journal entry (only DRAFT entries can be deleted)
@@ -527,11 +519,7 @@ async def delete_entry(
 async def post_entry(
     entry_id: str,
     post_request: JournalEntryPostRequest,
-    current_user: User = Depends(require_roles(
-        UserRole.SUPER_ADMIN,
-        UserRole.SCHOOL_ADMIN,
-        UserRole.HR,
-    )),
+    current_user: User = Depends(require_permission("finance.journal.post")),
     session: AsyncSession = Depends(get_session),
 ):
     """Post a journal entry to the General Ledger
@@ -581,6 +569,18 @@ async def post_entry(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Cannot post entry with status {entry.get('posting_status')} (only DRAFT entries can be posted)"
             )
+
+        # Segregation of duties (School.require_maker_checker, off by
+        # default): only gates the human "post this DRAFT entry" action here
+        # at the API boundary — not service.post_entry() itself, which is
+        # also called internally by reversal/period-close/expense-posting
+        # flows where the same actor creating and posting in one step is
+        # intentional and has no separate "checker" step to delegate to.
+        if entry.get("created_by") == current_user.id and await service.requires_maker_checker(school_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Segregation of duties: you created this entry and cannot also post it"
+            )
     except HTTPException:
         raise
     except Exception as e:
@@ -588,7 +588,7 @@ async def post_entry(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error retrieving entry: {str(e)}"
         )
-    
+
     try:
         posted_entry = await service.post_entry(
             school_id=school_id,
@@ -624,11 +624,7 @@ async def post_entry(
 async def reverse_entry(
     entry_id: str,
     reverse_request: JournalEntryReverseRequest,
-    current_user: User = Depends(require_roles(
-        UserRole.SUPER_ADMIN,
-        UserRole.SCHOOL_ADMIN,
-        UserRole.HR,
-    )),
+    current_user: User = Depends(require_permission("finance.journal.reverse")),
     session: AsyncSession = Depends(get_session),
 ):
     """Reverse a posted journal entry with a contra-entry

@@ -11,10 +11,11 @@ from pydantic import BaseModel
 from database import get_session
 from auth import get_current_user
 from models.user import User, UserRole
-from models.payment import OnlineTransaction, TransactionStatus, PaymentVerification 
+from models.payment import OnlineTransaction, TransactionStatus, PaymentVerification
 from models.finance import GLAccount, JournalLineItem, JournalEntry, PostingStatus, AccountType
-from models.fee import Fee, PaymentStatus as FeeStatus
+from models.fee import Fee, FeeStructure, PaymentStatus as FeeStatus
 from models.student import Student
+from services.finance_dashboard_service import compute_financial_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -59,158 +60,28 @@ async def get_dashboard_metrics(
     }
     ```
     """
-    try:
-        school_id = current_user.school_id
-        if not school_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No school context"
-            )
-        
-        # Import models
-        
-        
-        # Get all GL accounts for this school
-        account_query = select(GLAccount).where(
-            GLAccount.school_id == school_id,
-            GLAccount.is_active == True
+    school_id = current_user.school_id
+    if not school_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No school context"
         )
-        account_results = await session.execute(account_query)
-        gl_accounts = {acc.id: acc for acc in account_results.scalars().all()}
-        
-        if not gl_accounts:
-            # No accounts configured - return zeros
-            return {
-                "cashBalance": 0,
-                "accountsReceivable": 0,
-                "totalAssets": 0,
-                "accountsPayable": 0,
-                "netProfit": 0,
-                "profitMargin": 0,
-                "revenueBySource": []
-            }
-        
-        # Get all posted journal line items (only from posted entries)
-        posted_entries_query = select(JournalEntry.id).where(
-            JournalEntry.school_id == school_id,
-            JournalEntry.posting_status == PostingStatus.POSTED
-        )
-        posted_entries = await session.execute(posted_entries_query)
-        posted_entry_ids = [e for e in posted_entries.scalars().all()]
-        
-        if not posted_entry_ids:
-            # No posted entries - return zeros
-            return {
-                "cashBalance": 0,
-                "accountsReceivable": 0,
-                "totalAssets": 0,
-                "accountsPayable": 0,
-                "netProfit": 0,
-                "profitMargin": 0,
-                "revenueBySource": []
-            }
-        
-        # Get all line items for posted entries
-        line_items_query = select(
-            JournalLineItem.gl_account_id,
-            func.sum(JournalLineItem.debit_amount).label('total_debit'),
-            func.sum(JournalLineItem.credit_amount).label('total_credit')
-        ).where(
-            JournalLineItem.journal_entry_id.in_(posted_entry_ids)
-        ).group_by(JournalLineItem.gl_account_id)
-        
-        line_items_results = await session.execute(line_items_query)
-        account_balances = {}
-        
-        for gl_account_id, total_debit, total_credit in line_items_results.all():
-            account_balances[gl_account_id] = {
-                'debit': total_debit or 0,
-                'credit': total_credit or 0
-            }
-        
-        # Calculate metrics per account type
-        cash_balance = 0
-        accounts_receivable = 0
-        accounts_payable = 0
-        total_assets = 0
-        total_liabilities = 0
-        revenue = 0
-        expenses = 0
-        revenue_by_source = {}
-        
-        for account_id, account in gl_accounts.items():
-            balance_data = account_balances.get(account_id, {'debit': 0, 'credit': 0})
-            debit = balance_data['debit']
-            credit = balance_data['credit']
-            
-            # Calculate balance based on account type (normal balance rules)
-            if account.account_type == AccountType.ASSET:
-                balance = debit - credit  # Assets normally debit
-                total_assets += balance
-                
-                if "cash" in account.account_name.lower() or "checking" in account.account_name.lower():
-                    cash_balance += balance
-                elif "receivable" in account.account_name.lower():
-                    accounts_receivable += balance
-            
-            elif account.account_type == AccountType.LIABILITY:
-                balance = credit - debit  # Liabilities normally credit
-                total_liabilities += balance
-                
-                if "payable" in account.account_name.lower():
-                    accounts_payable += balance
-            
-            elif account.account_type == AccountType.REVENUE:
-                balance = credit - debit  # Revenue normally credit (income)
-                revenue += balance
-                revenue_by_source[account.account_name] = balance
-            
-            elif account.account_type == AccountType.EXPENSE:
-                balance = debit - credit  # Expenses normally debit (costs)
-                expenses += balance
-        
-        # Calculate profit and margin
-        net_profit = revenue - expenses
-        profit_margin = (net_profit / revenue * 100) if revenue > 0 else 0
-        
-        # Prepare revenue breakdown
-        total_revenue = sum(revenue_by_source.values()) if revenue_by_source else 0
-        revenue_breakdown = [
-            {
-                "name": name,
-                "amount": float(amount),
-                "percentage": round((amount / total_revenue * 100) if total_revenue > 0 else 0, 1)
-            }
-            for name, amount in sorted(revenue_by_source.items(), key=lambda x: x[1], reverse=True)
-            if amount > 0
-        ]
-        
-        accounts_payable = total_liabilities  # Simplified: all liabilities as accounts payable
-        
-        return {
-            "cashBalance": float(max(0, cash_balance)),
-            "accountsReceivable": float(max(0, accounts_receivable)),
-            "totalAssets": float(max(0, total_assets)),
-            "accountsPayable": float(max(0, accounts_payable)),
-            "netProfit": float(net_profit),
-            "profitMargin": round(profit_margin, 1),
-            "revenueBySource": revenue_breakdown
-        }
-    
-    except Exception as e:
-        logger.error(f"Error fetching dashboard metrics: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        # Return default safe values instead of error
-        return {
-            "cashBalance": 0,
-            "accountsReceivable": 0,
-            "totalAssets": 0,
-            "accountsPayable": 0,
-            "netProfit": 0,
-            "profitMargin": 0,
-            "revenueBySource": []
-        }
+
+    # GL-balance calculation lives in services/finance_dashboard_service.py —
+    # the same function backs routers/dashboard.py's real-time overview, so
+    # there's exactly one implementation of this math, not two. That service
+    # never raises (returns an all-zero snapshot on any error), which is why
+    # this endpoint no longer needs its own try/except around the calculation.
+    snapshot = await compute_financial_snapshot(session, school_id)
+    return {
+        "cashBalance": snapshot["cash_balance"],
+        "accountsReceivable": snapshot["accounts_receivable"],
+        "totalAssets": snapshot["total_assets"],
+        "accountsPayable": snapshot["accounts_payable"],
+        "netProfit": snapshot["net_profit"],
+        "profitMargin": snapshot["profit_margin"],
+        "revenueBySource": snapshot["revenue_by_source"],
+    }
 
 
 @router.get("/recent-transactions", status_code=200)
@@ -332,10 +203,11 @@ async def get_health_indicators(
         if not gl_accounts:
             return {"indicators": []}
         
-        # Get all posted journal entries
+        # Get all posted journal entries. POSTED *and* REVERSED, not POSTED
+        # alone: see get_dashboard_metrics for why.
         posted_entries_query = select(JournalEntry.id).where(
             JournalEntry.school_id == school_id,
-            JournalEntry.posting_status == PostingStatus.POSTED
+            JournalEntry.posting_status.in_([PostingStatus.POSTED, PostingStatus.REVERSED])
         )
         posted_entries = await session.execute(posted_entries_query)
         posted_entry_ids = [e for e in posted_entries.scalars().all()]
@@ -367,41 +239,73 @@ async def get_health_indicators(
         total_assets = 0
         total_liabilities = 0
         total_equity = 0
-        
+        inventory = 0
+        revenue = 0
+        expenses = 0
+
         for account_id, account in gl_accounts.items():
             balance_data = account_balances.get(account_id, {'debit': 0, 'credit': 0})
             debit = balance_data['debit']
             credit = balance_data['credit']
-            
+
             if account.account_type == AccountType.ASSET:
                 balance = debit - credit
                 total_assets += balance
                 if "current" in account.account_name.lower() or any(x in account.account_name.lower() for x in ["cash", "receivable", "inventory"]):
                     current_assets += balance
-            
+                if "inventory" in account.account_name.lower():
+                    inventory += balance
+
             elif account.account_type == AccountType.LIABILITY:
                 balance = credit - debit
                 total_liabilities += balance
                 if "current" in account.account_name.lower() or "payable" in account.account_name.lower():
                     current_liabilities += balance
-            
+
             elif account.account_type == AccountType.EQUITY:
                 balance = credit - debit
                 total_equity += balance
-        
-        # Calculate ratios
+
+            elif account.account_type == AccountType.REVENUE:
+                revenue += credit - debit
+
+            elif account.account_type == AccountType.EXPENSE:
+                expenses += debit - credit
+
+        net_profit = revenue - expenses
+
+        # Calculate ratios — all from the same account-balance aggregation
+        # above, no additional queries needed.
         current_ratio = (current_assets / current_liabilities) if current_liabilities > 0 else 0
+        quick_ratio = ((current_assets - inventory) / current_liabilities) if current_liabilities > 0 else 0
+        working_capital = current_assets - current_liabilities
         debt_to_equity = (total_liabilities / total_equity) if total_equity > 0 else 0
-        asset_turnover = 1.0  # Placeholder
-        
+        debt_ratio = (total_liabilities / total_assets) if total_assets > 0 else 0
+        net_profit_margin = (net_profit / revenue * 100) if revenue > 0 else 0
+        return_on_assets = (net_profit / total_assets * 100) if total_assets > 0 else 0
+        return_on_equity = (net_profit / total_equity * 100) if total_equity > 0 else 0
+        asset_turnover = (revenue / total_assets) if total_assets > 0 else 0
+
         # Determine health status
         def get_status(value, metric):
             if metric == "current_ratio":
                 return "healthy" if value >= 1.5 else "warning" if value >= 1.0 else "critical"
+            elif metric == "quick_ratio":
+                return "healthy" if value >= 1.0 else "warning" if value >= 0.5 else "critical"
+            elif metric == "working_capital":
+                return "healthy" if value >= 0 else "critical"
             elif metric == "debt_to_equity":
                 return "healthy" if value <= 0.5 else "warning" if value <= 1.0 else "critical"
+            elif metric == "debt_ratio":
+                return "healthy" if value <= 0.4 else "warning" if value <= 0.6 else "critical"
+            elif metric == "net_profit_margin":
+                return "healthy" if value >= 10 else "warning" if value >= 0 else "critical"
+            elif metric == "roa":
+                return "healthy" if value >= 5 else "warning" if value >= 0 else "critical"
+            elif metric == "roe":
+                return "healthy" if value >= 10 else "warning" if value >= 0 else "critical"
             return "normal"
-        
+
         indicators = [
             {
                 "label": "Current Ratio",
@@ -409,9 +313,39 @@ async def get_health_indicators(
                 "status": get_status(current_ratio, "current_ratio")
             },
             {
+                "label": "Quick Ratio",
+                "value": f"{quick_ratio:.2f}",
+                "status": get_status(quick_ratio, "quick_ratio")
+            },
+            {
+                "label": "Working Capital",
+                "value": f"{working_capital:,.2f}",
+                "status": get_status(working_capital, "working_capital")
+            },
+            {
                 "label": "Debt-to-Equity",
                 "value": f"{debt_to_equity:.2f}",
                 "status": get_status(debt_to_equity, "debt_to_equity")
+            },
+            {
+                "label": "Debt Ratio",
+                "value": f"{debt_ratio:.2f}",
+                "status": get_status(debt_ratio, "debt_ratio")
+            },
+            {
+                "label": "Net Profit Margin",
+                "value": f"{net_profit_margin:.1f}%",
+                "status": get_status(net_profit_margin, "net_profit_margin")
+            },
+            {
+                "label": "Return on Assets (ROA)",
+                "value": f"{return_on_assets:.1f}%",
+                "status": get_status(return_on_assets, "roa")
+            },
+            {
+                "label": "Return on Equity (ROE)",
+                "value": f"{return_on_equity:.1f}%",
+                "status": get_status(return_on_equity, "roe")
             },
             {
                 "label": "Asset Turnover",
@@ -419,7 +353,7 @@ async def get_health_indicators(
                 "status": "normal"
             }
         ]
-        
+
         return {"indicators": indicators}
     
     except Exception as e:
@@ -829,27 +763,41 @@ async def get_payments_by_fee_type(
     ```
     """
     try:
+        # fee_type lives on FeeStructure, not Fee — the previous query
+        # selected Fee.fee_type directly, which doesn't exist on that model
+        # and raised an AttributeError on every call (caught below and
+        # turned into a 500 with no useful detail, so this endpoint has
+        # never actually returned data). Joined to FeeStructure to resolve
+        # fee_type properly, and grouped straight off Fee rather than
+        # through OnlineTransaction — that inner join silently excluded
+        # every fee paid by cash, bank transfer, or mobile money
+        # (FeePayment, the general payment path most fees actually use).
+        # "transaction_count" below is the fee count in this group, not a
+        # literal transaction count, matching what the response returns.
         query = select(
-            Fee.fee_type,
+            FeeStructure.fee_type,
             func.sum(Fee.amount_due).label('total_due'),
             func.sum(Fee.amount_paid).label('total_paid'),
+            func.sum(Fee.discount).label('total_discount'),
             func.count(Fee.id).label('fee_count')
         ).select_from(Fee).join(
-            OnlineTransaction, Fee.id == OnlineTransaction.fee_id
+            FeeStructure, Fee.fee_structure_id == FeeStructure.id
         ).where(
             Fee.school_id == school_id
-        ).group_by(Fee.fee_type)
-        
+        ).group_by(FeeStructure.fee_type)
+
         results = await session.exec(query)
         fee_types = results.all()
-        
+
         summary = []
-        for fee_type, total_due, total_paid, count in fee_types:
+        for fee_type, total_due, total_paid, total_discount, count in fee_types:
             total_due = float(total_due or 0)
             total_paid = float(total_paid or 0)
-            total_pending = total_due - total_paid
-            collection_rate = (total_paid / total_due * 100) if total_due > 0 else 0
-            
+            total_discount = float(total_discount or 0)
+            total_pending = max(0, total_due - total_paid - total_discount)
+            net_due = total_due - total_discount
+            collection_rate = (total_paid / net_due * 100) if net_due > 0 else 0
+
             summary.append({
                 "fee_type": fee_type,
                 "total_due": total_due,

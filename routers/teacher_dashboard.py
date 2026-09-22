@@ -53,22 +53,22 @@ async def get_dashboard(
         result = await session.execute(assignments_query)
         active_assignments = result.scalar() or 0
         
-        # Get pending submissions for assignments in this term (not graded)
+        # Get pending submissions for MY assignments (not graded) — must join
+        # to Assignment and scope by teacher_id, otherwise this counts every
+        # teacher's pending submissions school-wide.
         from sqlalchemy import and_
-        submissions_query = select(func.count(Submission.id)).where(
+        submissions_query = select(func.count(Submission.id)).select_from(Submission).join(
+            Assignment,
+            Submission.assignment_id == Assignment.id
+        ).where(
             and_(
                 Submission.school_id == school_id,
+                Assignment.teacher_id == teacher_id,
                 Submission.status.in_([SubmissionStatus.SUBMITTED, SubmissionStatus.LATE])
             )
         )
         if term_id:
-            # Join with Assignment to filter by term
-            submissions_query = submissions_query.select_from(Submission).join(
-                Assignment,
-                Submission.assignment_id == Assignment.id
-            ).where(
-                Assignment.academic_term_id == term_id
-            )
+            submissions_query = submissions_query.where(Assignment.academic_term_id == term_id)
         result = await session.execute(submissions_query)
         pending_grading = result.scalar() or 0
         
@@ -143,35 +143,33 @@ async def get_quick_stats(
         result = await session.execute(draft_query)
         draft_count = result.scalar() or 0
         
-        # Total submissions received for this term
-        total_subs_query = select(func.count(Submission.id)).where(
+        # Total submissions received for MY assignments — must join to
+        # Assignment and scope by teacher_id, otherwise this counts every
+        # teacher's submissions school-wide despite being labeled "personal".
+        total_subs_query = select(func.count(Submission.id)).select_from(Submission).join(
+            Assignment,
+            Submission.assignment_id == Assignment.id
+        ).where(
             Submission.school_id == school_id,
+            Assignment.teacher_id == teacher_id,
             Submission.status == SubmissionStatus.SUBMITTED
         )
         if term_id:
-            # Join with Assignment to filter by term
-            total_subs_query = total_subs_query.select_from(Submission).join(
-                Assignment,
-                Submission.assignment_id == Assignment.id
-            ).where(
-                Assignment.academic_term_id == term_id
-            )
+            total_subs_query = total_subs_query.where(Assignment.academic_term_id == term_id)
         result = await session.execute(total_subs_query)
         total_submissions = result.scalar() or 0
-        
-        # Submissions graded for this term
-        graded_query = select(func.count(Submission.id)).where(
+
+        # Submissions graded for MY assignments — same teacher_id scoping.
+        graded_query = select(func.count(Submission.id)).select_from(Submission).join(
+            Assignment,
+            Submission.assignment_id == Assignment.id
+        ).where(
             Submission.school_id == school_id,
+            Assignment.teacher_id == teacher_id,
             Submission.status == SubmissionStatus.GRADED
         )
         if term_id:
-            # Join with Assignment to filter by term
-            graded_query = graded_query.select_from(Submission).join(
-                Assignment,
-                Submission.assignment_id == Assignment.id
-            ).where(
-                Assignment.academic_term_id == term_id
-            )
+            graded_query = graded_query.where(Assignment.academic_term_id == term_id)
         result = await session.execute(graded_query)
         graded_submissions = result.scalar() or 0
         

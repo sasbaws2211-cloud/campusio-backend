@@ -11,10 +11,14 @@ from auth import get_current_user, require_roles
 from models.user import User, UserRole
 from services.settlement_service import SettlementService
 from services.paystack_service import PaystackService
+from services.plan_gating import require_plan_feature
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/settlements", tags=["settlements"])
+router = APIRouter(
+    prefix="/settlements", tags=["settlements"],
+    dependencies=[Depends(require_plan_feature("fees_plus"))],
+)
 
 
 def get_settlement_service():

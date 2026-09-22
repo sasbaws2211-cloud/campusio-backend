@@ -1,16 +1,19 @@
 """Classes and Subjects router"""
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlmodel import select, func, SQLModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import and_
+from sqlalchemy.exc import IntegrityError
 from datetime import datetime
 from typing import Optional
-from models.classroom import Class, ClassCreate, ClassLevel, Subject, SubjectCreate, SubjectCategory, ClassSubject
-from models.student import Student
+from models.classroom import Class, ClassCreate, ClassUpdate, ClassLevel, Subject, SubjectCreate, SubjectCategory, ClassSubject, ClassWaitlistEntry
+from models.student import Student, StudentStatus
 from models.staff import Staff, TeacherAssignment
+from models.school import AcademicTerm
 from models.user import User, UserRole
 from database import get_session
-from auth import get_current_user, require_roles
+from auth import get_current_user, require_permission
+from dependencies import resolve_campus_scope, resolve_write_campus_id, assert_campus_access
 
 router = APIRouter(prefix="/classes", tags=["Classes & Subjects"])
 
@@ -19,23 +22,46 @@ class AssignSubjectRequest(SQLModel):
     academic_term_id: str
 
 
+async def validate_academic_term(session: AsyncSession, school_id: str, academic_term_id: Optional[str]) -> None:
+    """Reject a class/link pointing at an academic term that doesn't exist for this
+    school, rather than silently creating a row with a dangling reference."""
+    if not academic_term_id:
+        return
+    result = await session.execute(
+        select(AcademicTerm).where(
+            AcademicTerm.id == academic_term_id,
+            AcademicTerm.school_id == school_id
+        )
+    )
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="academic_term_id does not exist for this school")
+
+
 
 @router.post("", response_model=dict)
 async def create_class(
     class_data: ClassCreate,
-    current_user: User = Depends(require_roles(UserRole.SUPER_ADMIN, UserRole.SCHOOL_ADMIN)),
+    current_user: User = Depends(require_permission("academics.class.manage")),
     session: AsyncSession = Depends(get_session)
 ):
     """Create a new class"""
     school_id = current_user.school_id
     if not school_id and current_user.role != UserRole.SUPER_ADMIN:
         raise HTTPException(status_code=400, detail="No school context")
-    
+
+    await validate_academic_term(session, school_id, class_data.academic_term_id)
+
+    class_data.campus_id = resolve_write_campus_id(current_user, class_data.campus_id)
+
     cls = Class(school_id=school_id, **class_data.model_dump())
     session.add(cls)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(status_code=400, detail="A class with this name, level, and section already exists")
     await session.refresh(cls)
-    
+
     return {
         "id": cls.id,
         "school_id": cls.school_id,
@@ -53,6 +79,7 @@ async def create_class(
 async def list_classes(
     level: Optional[ClassLevel] = None,
     is_active: Optional[bool] = None,
+    campus_id: Optional[str] = None,
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session)
 ):
@@ -71,19 +98,31 @@ async def list_classes(
     
     if is_active is not None:
         query = query.where(Class.is_active == is_active)
-    
+
+    campus_id = resolve_campus_scope(current_user, campus_id)
+    if campus_id:
+        query = query.where(Class.campus_id == campus_id)
+
     query = query.order_by(Class.level, Class.name)
     
     result = await session.execute(query)
     classes = result.scalars().all()
-    
+
+    class_ids = [c.id for c in classes]
     class_student_counts = {}
-    for cls in classes:
-        count_result = await session.execute(
-            select(func.count(Student.id)).where(Student.class_id == cls.id)
+    if class_ids:
+        # active students only — a student's class_id is never cleared when
+        # they exit (graduate/transfer/withdraw/get expelled), so an
+        # unfiltered count here disagrees with every other "class size"
+        # figure in the app (report-card rankings, dashboard per-class
+        # summaries), which already filter this way.
+        counts_result = await session.execute(
+            select(Student.class_id, func.count(Student.id))
+            .where(Student.class_id.in_(class_ids), Student.status == StudentStatus.ACTIVE)
+            .group_by(Student.class_id)
         )
-        class_student_counts[cls.id] = count_result.scalar()
-    
+        class_student_counts = dict(counts_result.all())
+
     return [
         {
             "id": c.id,
@@ -93,6 +132,7 @@ async def list_classes(
             "section": c.section,
             "capacity": c.capacity,
             "room_number": c.room_number,
+            "campus_id": c.campus_id,
             "is_active": c.is_active,
             "student_count": class_student_counts.get(c.id, 0)
         }
@@ -115,9 +155,11 @@ async def get_class(
     
     if current_user.role != UserRole.SUPER_ADMIN and current_user.school_id != cls.school_id:
         raise HTTPException(status_code=403, detail="Access denied")
-    
+    assert_campus_access(current_user, cls.campus_id)
+
+    # active only — see the same note on the class-list endpoint above.
     student_result = await session.execute(
-        select(Student).where(Student.class_id == class_id).order_by(Student.first_name)
+        select(Student).where(Student.class_id == class_id, Student.status == StudentStatus.ACTIVE).order_by(Student.first_name)
     )
     students = student_result.scalars().all()
     
@@ -212,13 +254,14 @@ async def get_class_students(
     
     if not cls:
         raise HTTPException(status_code=404, detail="Class not found")
-    
+
     if current_user.role != UserRole.SUPER_ADMIN and current_user.school_id != cls.school_id:
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    # Get students in this class
+    assert_campus_access(current_user, cls.campus_id)
+
+    # Get students in this class (active only — see the note on the class-list endpoint above)
     student_result = await session.execute(
-        select(Student).where(Student.class_id == class_id)
+        select(Student).where(Student.class_id == class_id, Student.status == StudentStatus.ACTIVE)
     )
     students = student_result.scalars().all()
     
@@ -241,23 +284,41 @@ async def get_class_students(
 @router.put("/{class_id}", response_model=dict)
 async def update_class(
     class_id: str,
-    class_data: ClassCreate,
-    current_user: User = Depends(require_roles(UserRole.SUPER_ADMIN, UserRole.SCHOOL_ADMIN)),
+    class_data: ClassUpdate,
+    current_user: User = Depends(require_permission("academics.class.manage")),
     session: AsyncSession = Depends(get_session)
 ):
-    """Update class details"""
+    """Update class details. Partial update — only fields present in the request are changed."""
     result = await session.execute(select(Class).where(Class.id == class_id))
     cls = result.scalar_one_or_none()
-    
+
     if not cls:
         raise HTTPException(status_code=404, detail="Class not found")
-    
+
     if current_user.role == UserRole.SCHOOL_ADMIN and current_user.school_id != cls.school_id:
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    for key, value in class_data.model_dump().items():
+    assert_campus_access(current_user, cls.campus_id)
+
+    update_data = class_data.model_dump(exclude_unset=True)
+    if current_user.campus_id:
+        update_data["campus_id"] = current_user.campus_id
+
+    if "academic_term_id" in update_data:
+        await validate_academic_term(session, cls.school_id, update_data["academic_term_id"])
+
+    if "capacity" in update_data:
+        active_count = (await session.execute(
+            select(func.count(Student.id)).where(Student.class_id == class_id, Student.status == StudentStatus.ACTIVE)
+        )).scalar() or 0
+        if update_data["capacity"] < active_count:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot set capacity below the class's current active enrollment ({active_count} students)",
+            )
+
+    for key, value in update_data.items():
         setattr(cls, key, value)
-    
+
     cls.updated_at = datetime.utcnow()
     session.add(cls)
     await session.commit()
@@ -269,7 +330,7 @@ async def update_class(
 @router.post("/subjects", response_model=dict)
 async def create_subject(
     subject_data: SubjectCreate,
-    current_user: User = Depends(require_roles(UserRole.SUPER_ADMIN, UserRole.SCHOOL_ADMIN)),
+    current_user: User = Depends(require_permission("academics.subject.manage")),
     session: AsyncSession = Depends(get_session)
 ):
     """Create a new subject"""
@@ -279,9 +340,13 @@ async def create_subject(
     
     subject = Subject(school_id=school_id, **subject_data.model_dump())
     session.add(subject)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(status_code=400, detail="A subject with this code already exists")
     await session.refresh(subject)
-    
+
     return {
         "id": subject.id,
         "school_id": subject.school_id,
@@ -337,13 +402,27 @@ async def assign_subject_to_class(
     class_id: str,
     subject_id: str,
     body: AssignSubjectRequest,
-    current_user: User = Depends(require_roles(UserRole.SUPER_ADMIN, UserRole.SCHOOL_ADMIN)),
+    current_user: User = Depends(require_permission("academics.class_subject.manage")),
     session: AsyncSession = Depends(get_session)
 ):
     """Assign a subject to a class"""
     academic_term_id = body.academic_term_id
-    school_id = current_user.school_id
-    
+
+    class_result = await session.execute(select(Class).where(Class.id == class_id))
+    cls = class_result.scalar_one_or_none()
+    if not cls:
+        raise HTTPException(status_code=404, detail="Class not found")
+    if current_user.role != UserRole.SUPER_ADMIN and current_user.school_id != cls.school_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    assert_campus_access(current_user, cls.campus_id)
+
+    subject_result = await session.execute(select(Subject).where(Subject.id == subject_id))
+    subject = subject_result.scalar_one_or_none()
+    if not subject or (current_user.role != UserRole.SUPER_ADMIN and subject.school_id != current_user.school_id):
+        raise HTTPException(status_code=404, detail="Subject not found")
+
+    await validate_academic_term(session, cls.school_id, academic_term_id)
+
     existing = await session.execute(
         select(ClassSubject).where(
             ClassSubject.class_id == class_id,
@@ -355,14 +434,20 @@ async def assign_subject_to_class(
         raise HTTPException(status_code=400, detail="Subject already assigned to this class")
     
     link = ClassSubject(
-        school_id=school_id,
+        school_id=cls.school_id,
         class_id=class_id,
         subject_id=subject_id,
         academic_term_id=academic_term_id
     )
     session.add(link)
-    await session.commit()
-    
+    try:
+        await session.commit()
+    except IntegrityError:
+        # Backstop for the race between the existence check above and this
+        # insert — two concurrent requests could both pass the check.
+        await session.rollback()
+        raise HTTPException(status_code=400, detail="Subject already assigned to this class")
+
     return {"message": "Subject assigned to class"}
 
 
@@ -370,22 +455,149 @@ async def assign_subject_to_class(
 async def remove_subject_from_class(
     class_id: str,
     subject_id: str,
-    current_user: User = Depends(require_roles(UserRole.SUPER_ADMIN, UserRole.SCHOOL_ADMIN)),
+    academic_term_id: str = Query(..., description="Which term's class-subject link to remove — the same subject can be assigned to a class across multiple terms, so this disambiguates which one"),
+    current_user: User = Depends(require_permission("academics.class_subject.manage")),
     session: AsyncSession = Depends(get_session)
 ):
-    """Remove a subject from a class"""
+    """Remove a subject from a class for a specific term. Required, not
+    inferred — assign_subject_to_class always scopes creation by term too
+    (a class+subject can legitimately have a separate link per term), so
+    there's no single "the" link to fall back to without one."""
     result = await session.execute(
         select(ClassSubject).where(
             ClassSubject.class_id == class_id,
-            ClassSubject.subject_id == subject_id
+            ClassSubject.subject_id == subject_id,
+            ClassSubject.academic_term_id == academic_term_id,
         )
     )
     link = result.scalar_one_or_none()
-    
+
     if not link:
-        raise HTTPException(status_code=404, detail="Subject not assigned to this class")
-    
+        raise HTTPException(status_code=404, detail="Subject not assigned to this class for that term")
+
+    if current_user.role != UserRole.SUPER_ADMIN and current_user.school_id != link.school_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    # ClassSubject carries no campus_id of its own -- check via the Class it links.
+    class_result = await session.execute(select(Class).where(Class.id == link.class_id))
+    cls = class_result.scalar_one_or_none()
+    if cls:
+        assert_campus_access(current_user, cls.campus_id)
+
     await session.delete(link)
     await session.commit()
-    
+
     return {"message": "Subject removed from class"}
+
+
+# ── Waitlist ────────────────────────────────────────────────────────────
+# Entries are created by routers.students.check_class_capacity(auto_waitlist=True)
+# and the bulk-promotion except-branch when a class is full — see that
+# module for how entries land here in the first place.
+
+@router.get("/{class_id}/waitlist", response_model=list[dict])
+async def list_class_waitlist(
+    class_id: str,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session)
+):
+    """The class's waitlist queue, ordered by position (earliest request first)."""
+    class_result = await session.execute(select(Class).where(Class.id == class_id))
+    cls = class_result.scalar_one_or_none()
+    if not cls:
+        raise HTTPException(status_code=404, detail="Class not found")
+    if current_user.role != UserRole.SUPER_ADMIN and current_user.school_id != cls.school_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    assert_campus_access(current_user, cls.campus_id)
+
+    result = await session.execute(
+        select(ClassWaitlistEntry).where(ClassWaitlistEntry.class_id == class_id).order_by(ClassWaitlistEntry.position)
+    )
+    entries = result.scalars().all()
+
+    student_ids = [e.student_id for e in entries]
+    student_names: dict = {}
+    if student_ids:
+        student_result = await session.execute(select(Student).where(Student.id.in_(student_ids)))
+        student_names = {s.id: f"{s.first_name} {s.last_name}" for s in student_result.scalars().all()}
+
+    return [{**e.model_dump(), "student_name": student_names.get(e.student_id, "Unknown")} for e in entries]
+
+
+@router.post("/{class_id}/waitlist/{entry_id}/offer", response_model=dict)
+async def offer_waitlist_seat(
+    class_id: str,
+    entry_id: str,
+    current_user: User = Depends(require_permission("academics.waitlist.manage")),
+    session: AsyncSession = Depends(get_session)
+):
+    """Enroll the waitlisted student into the class (a seat has freed up) and
+    mark their entry "enrolled". This is a deliberate admin action offering a
+    specific freed seat, so it enrolls directly rather than re-checking
+    capacity / re-waitlisting."""
+    class_result = await session.execute(select(Class).where(Class.id == class_id))
+    cls = class_result.scalar_one_or_none()
+    if not cls:
+        raise HTTPException(status_code=404, detail="Class not found")
+    if current_user.role != UserRole.SUPER_ADMIN and current_user.school_id != cls.school_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    assert_campus_access(current_user, cls.campus_id)
+
+    entry_result = await session.execute(
+        select(ClassWaitlistEntry).where(ClassWaitlistEntry.id == entry_id, ClassWaitlistEntry.class_id == class_id)
+    )
+    entry = entry_result.scalar_one_or_none()
+    if not entry:
+        raise HTTPException(status_code=404, detail="Waitlist entry not found")
+    if entry.status != "waiting":
+        raise HTTPException(status_code=400, detail=f"This entry is already {entry.status}, not waiting")
+
+    student_result = await session.execute(select(Student).where(Student.id == entry.student_id))
+    student = student_result.scalar_one_or_none()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+
+    student.class_id = class_id
+    student.updated_at = datetime.utcnow()
+    session.add(student)
+
+    entry.status = "enrolled"
+    session.add(entry)
+
+    from routers.students import _record_enrollment
+    await _record_enrollment(session, cls.school_id, student.id, class_id, reason="waitlist_offer")
+
+    await session.commit()
+
+    return {"message": f"{student.first_name} {student.last_name} enrolled from the waitlist", "student_id": student.id, "entry_id": entry.id}
+
+
+@router.delete("/{class_id}/waitlist/{entry_id}", response_model=dict)
+async def cancel_waitlist_entry(
+    class_id: str,
+    entry_id: str,
+    current_user: User = Depends(require_permission("academics.waitlist.manage")),
+    session: AsyncSession = Depends(get_session)
+):
+    """Cancel a waitlist entry (student no longer wants the seat, or an admin
+    is clearing a stale request)."""
+    class_result = await session.execute(select(Class).where(Class.id == class_id))
+    cls = class_result.scalar_one_or_none()
+    if not cls:
+        raise HTTPException(status_code=404, detail="Class not found")
+    if current_user.role != UserRole.SUPER_ADMIN and current_user.school_id != cls.school_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    assert_campus_access(current_user, cls.campus_id)
+
+    entry_result = await session.execute(
+        select(ClassWaitlistEntry).where(ClassWaitlistEntry.id == entry_id, ClassWaitlistEntry.class_id == class_id)
+    )
+    entry = entry_result.scalar_one_or_none()
+    if not entry:
+        raise HTTPException(status_code=404, detail="Waitlist entry not found")
+
+    entry.status = "cancelled"
+    session.add(entry)
+    await session.commit()
+
+    return {"message": "Waitlist entry cancelled", "entry_id": entry.id}

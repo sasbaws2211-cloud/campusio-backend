@@ -15,12 +15,15 @@ from models.billing import PlatformSubscription, SubscriptionStatus, BillingPlan
 from models.ticket import Ticket, TicketStatus
 from database import get_session
 from auth import get_current_user, require_roles
+from dependencies import resolve_campus_scope
+from services.finance_dashboard_service import compute_financial_snapshot
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
 
 @router.get("/overview", response_model=dict)
 async def get_dashboard_overview(
+    campus_id: str | None = None,
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session)
 ):
@@ -56,10 +59,23 @@ async def get_dashboard_overview(
     
     if not school_id:
         raise HTTPException(status_code=403, detail="No school context")
-    
+
+    campus_id = resolve_campus_scope(current_user, campus_id)
+
     # 🚀 OPTIMIZATION: Combined statistics query - avoid multiple database round trips
     today = date.today().isoformat()
-    
+
+    staff_join_cond = and_(Staff.school_id == school_id, Staff.status == StaffStatus.ACTIVE)
+    class_join_cond = and_(Class.school_id == school_id, Class.is_active == True)
+    student_where = [Student.school_id == school_id, Student.status == StudentStatus.ACTIVE]
+    # Attendance/Fee carry no campus_id (see models/campus.py) — a campus view
+    # narrows students/staff/classes, but attendance-today and fee totals stay
+    # school-wide until those tables grow campus scoping too.
+    if campus_id:
+        staff_join_cond = and_(staff_join_cond, Staff.campus_id == campus_id)
+        class_join_cond = and_(class_join_cond, Class.campus_id == campus_id)
+        student_where.append(Student.campus_id == campus_id)
+
     stats_result = await session.execute(
         select(
             func.count(func.distinct(Student.id)).label("total_students"),
@@ -84,27 +100,30 @@ async def get_dashboard_overview(
                 )
             )).label("absent_count"),
             func.sum(Fee.amount_due).label("total_fees"),
-            func.sum(Fee.amount_paid).label("total_fees_collected")
+            func.sum(Fee.amount_paid).label("total_fees_collected"),
+            func.sum(Fee.discount).label("total_fees_discount")
         )
         .select_from(Student)
-        .outerjoin(Staff, and_(Staff.school_id == school_id, Staff.status == StaffStatus.ACTIVE))
-        .outerjoin(Class, and_(Class.school_id == school_id, Class.is_active == True))
+        .outerjoin(Staff, staff_join_cond)
+        .outerjoin(Class, class_join_cond)
         .outerjoin(Attendance, and_(
             Attendance.school_id == school_id,
             Attendance.attendance_date == today
         ))
         .outerjoin(Fee, Fee.school_id == school_id)
-        .where(
-            Student.school_id == school_id,
-            Student.status == StudentStatus.ACTIVE
-        )
+        .where(*student_where)
     )
-    
+
     row = stats_result.first()
 
     total_fees = row.total_fees or 0
     collected = row.total_fees_collected or 0
-    outstanding = total_fees - collected
+    fees_discount = row.total_fees_discount or 0
+    # Net billable (due minus discount) — a discount means that portion was
+    # never expected to be collected, so it shouldn't inflate "outstanding"
+    # or deflate "collection_rate" below.
+    net_fees = total_fees - fees_discount
+    outstanding = net_fees - collected
     present = row.present_count or 0
     absent = row.absent_count or 0
 
@@ -116,8 +135,17 @@ async def get_dashboard_overview(
     )
     has_current_term = current_term_result.scalar_one_or_none() is not None
 
+    # Real-time revenue/profit — same shared GL-balance calculation
+    # routers/finance_reports.py::get_dashboard_metrics uses (see
+    # services/finance_dashboard_service.py), so this stays additive to the
+    # existing billed/collected/outstanding fee figures above rather than a
+    # second, possibly-divergent implementation. Never raises — an all-zero
+    # snapshot just means the school hasn't posted any GL journal entries yet.
+    financial_snapshot = await compute_financial_snapshot(session, school_id)
+
     return {
         "role": current_user.role,
+        "campus_id": campus_id,
         "has_current_term": has_current_term,
         "stats": {
             "total_students": row.total_students or 0,
@@ -132,8 +160,14 @@ async def get_dashboard_overview(
             "fees": {
                 "total": total_fees,
                 "collected": collected,
+                "discount": fees_discount,
                 "outstanding": outstanding,
-                "collection_rate": round(collected / total_fees * 100, 1) if total_fees > 0 else 0
+                "collection_rate": round(collected / net_fees * 100, 1) if net_fees > 0 else 0
+            },
+            "finance": {
+                "net_profit": financial_snapshot["net_profit"],
+                "profit_margin": financial_snapshot["profit_margin"],
+                "revenue_by_source": financial_snapshot["revenue_by_source"],
             }
         }
     }
@@ -141,6 +175,7 @@ async def get_dashboard_overview(
 
 @router.get("/class-summary", response_model=list[dict])
 async def get_class_summary(
+    campus_id: str | None = None,
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session)
 ):
@@ -148,12 +183,14 @@ async def get_class_summary(
     school_id = current_user.school_id
     if not school_id:
         raise HTTPException(status_code=403, detail="No school context")
-    
+
+    campus_id = resolve_campus_scope(current_user, campus_id)
+    class_filters = [Class.school_id == school_id, Class.is_active == True]
+    if campus_id:
+        class_filters.append(Class.campus_id == campus_id)
+
     classes_result = await session.execute(
-        select(Class).where(
-            Class.school_id == school_id,
-            Class.is_active == True
-        ).order_by(Class.level, Class.name)
+        select(Class).where(*class_filters).order_by(Class.level, Class.name)
     )
     classes = classes_result.scalars().all()
     
@@ -176,7 +213,8 @@ async def get_class_summary(
         )
         attendance = attendance_result.scalars().all()
         present = sum(1 for a in attendance if a.status == AttendanceStatus.PRESENT)
-        
+        late = sum(1 for a in attendance if a.status == AttendanceStatus.LATE)
+
         summaries.append({
             "id": cls.id,
             "name": cls.name,
@@ -184,7 +222,7 @@ async def get_class_summary(
             "capacity": cls.capacity,
             "student_count": student_count,
             "attendance_today": present,
-            "attendance_rate": round(present / student_count * 100, 1) if student_count > 0 else 0
+            "attendance_rate": round((present + late) / student_count * 100, 1) if student_count > 0 else 0
         })
     
     return summaries
@@ -192,6 +230,7 @@ async def get_class_summary(
 
 @router.get("/gender-distribution", response_model=dict)
 async def get_gender_distribution(
+    campus_id: str | None = None,
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session)
 ):
@@ -199,24 +238,21 @@ async def get_gender_distribution(
     school_id = current_user.school_id
     if not school_id:
         raise HTTPException(status_code=403, detail="No school context")
-    
+
     from models.student import Gender
-    
+
+    campus_id = resolve_campus_scope(current_user, campus_id)
+    base_filters = [Student.school_id == school_id, Student.status == StudentStatus.ACTIVE]
+    if campus_id:
+        base_filters.append(Student.campus_id == campus_id)
+
     male_result = await session.execute(
-        select(func.count(Student.id)).where(
-            Student.school_id == school_id,
-            Student.gender == Gender.MALE,
-            Student.status == StudentStatus.ACTIVE
-        )
+        select(func.count(Student.id)).where(*base_filters, Student.gender == Gender.MALE)
     )
     male_count = male_result.scalar()
-    
+
     female_result = await session.execute(
-        select(func.count(Student.id)).where(
-            Student.school_id == school_id,
-            Student.gender == Gender.FEMALE,
-            Student.status == StudentStatus.ACTIVE
-        )
+        select(func.count(Student.id)).where(*base_filters, Student.gender == Gender.FEMALE)
     )
     female_count = female_result.scalar()
     
@@ -262,11 +298,16 @@ async def get_super_admin_oversight(
     )
     staff_by_school = {row.school_id: row.count for row in staff_result.all()}
 
-    # 4. Get subscription sums grouped by school_id
+    # 4. Get subscription sums grouped by school_id. Sums final_amount_due
+    # (net of discount/late-fee/proration — what the school actually owes),
+    # not total_amount_due (gross student_count x unit_price before any of
+    # that) — otherwise a bulk-discounted school shows inflated outstanding
+    # and an artificially low collection_rate below, the same bug fixed for
+    # student fees in routers/fees.py.
     subscription_sums_result = await session.execute(
         select(
             PlatformSubscription.school_id,
-            func.sum(PlatformSubscription.total_amount_due).label("total_due"),
+            func.sum(PlatformSubscription.final_amount_due).label("total_due"),
             func.sum(PlatformSubscription.amount_paid).label("total_paid")
         )
         .group_by(PlatformSubscription.school_id)
@@ -306,7 +347,10 @@ async def get_super_admin_oversight(
     overdue_subs = overdue_result.scalars().all()
     overdue_by_school = {sub.school_id: True for sub in overdue_subs}
     overdue_subscriptions_count = len(overdue_subs)
-    overdue_amount = sum((s.total_amount_due - s.amount_paid) for s in overdue_subs)
+    # final_amount_due (net of discount/late-fee/proration), matching the
+    # `outstanding` figure above — this was using total_amount_due (gross),
+    # overstating "overdue" for any discounted/prorated subscription.
+    overdue_amount = sum((s.final_amount_due - s.amount_paid) for s in overdue_subs)
 
     # 6. Get open ticket counts grouped by school_id
     tickets_result = await session.execute(

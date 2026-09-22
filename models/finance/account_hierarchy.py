@@ -7,6 +7,20 @@ Supports:
 - Parent-child account relationships
 - Balance rollup from detail to summary accounts
 - Consolidated reporting by hierarchy level
+
+Deliberately separate from GLAccount.parent_account_id (chart_of_accounts.py):
+that field is the ONE natural chart-of-accounts tree every account already
+has. This module is for building any number of ADDITIONAL, overlapping
+rollup views on top of that same set of accounts — e.g. an organizational/
+cost-center hierarchy and a program/fund hierarchy that group the same GL
+accounts two different ways for two different audiences — which a single
+parent_account_id column can't represent at all. AccountHierarchyService's
+rollup calculation reads real GLAccount.current_balance figures (not a
+separately-maintained shadow balance), so a hierarchy built here always
+reflects live GL data; it just isn't referenced by the standard reports
+(trial balance/balance sheet/P&L) — a school only sees it by calling
+routers/account_hierarchy_router.py directly, e.g. to build a
+departmental or program rollup those standard statements don't offer.
 """
 from sqlmodel import SQLModel, Field
 from sqlalchemy import JSON
@@ -100,34 +114,6 @@ class HierarchyNode(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
-class HierarchyRelationship(SQLModel, table=True):
-    """Hierarchy Relationship - Parent-child account linkage
-    
-    Explicitly defines the parent-child relationships in the hierarchy.
-    Allows for flexible account structures.
-    """
-    __tablename__ = "hierarchy_relationships"
-    
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
-    school_id: str = Field(index=True)
-    
-    # References
-    hierarchy_id: str = Field(index=True)
-    parent_node_id: str = Field(index=True)  # FK to parent HierarchyNode
-    child_node_id: str = Field(index=True)  # FK to child HierarchyNode
-    
-    # Relationship details
-    child_sequence: int = 0  # Order of child within parent
-    contribution_percentage: float = 100.0  # What % of child goes to parent (default 100%)
-    
-    # Validation
-    is_active: bool = Field(default=True, index=True)
-    
-    # Audit
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
-
-
 class HierarchyRollup(SQLModel, table=True):
     """Hierarchy Rollup - Pre-calculated rollup balance snapshot
     
@@ -209,15 +195,6 @@ class HierarchyNodeResponse(SQLModel):
     opening_balance: float
     children_count: int
     is_parent: bool
-
-
-class HierarchyRelationshipCreate(SQLModel):
-    """Validation model for hierarchy relationship"""
-    hierarchy_id: str
-    parent_node_id: str
-    child_node_id: str
-    child_sequence: int = 0
-    contribution_percentage: float = 100.0
 
 
 class HierarchyTreeResponse(SQLModel):

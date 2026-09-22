@@ -477,3 +477,116 @@ class SubmissionSummary(SQLModel):
     submission_date: Optional[datetime]
     score: Optional[float]
     feedback: Optional[str]
+
+
+# ============================================================================
+# MODEL 6: COURSE MODULE - Structured LMS module container
+# ============================================================================
+
+class CourseModule(SQLModel, table=True):
+    """
+    Ordered container of learning items (embedded video links and/or
+    existing LearningMaterial rows) for a class/subject/term — the
+    structural unit of the lightweight LMS. Publishing gates visibility to
+    students, same idiom as LearningMaterial.is_published.
+    """
+    __tablename__ = "course_modules"
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    school_id: str = Field(index=True)
+
+    teacher_id: str = Field(index=True)  # Staff.id
+    class_id: str = Field(index=True)
+    subject_id: str = Field(index=True)
+    academic_term_id: str = Field(sa_column=Column(String, ForeignKey("academic_terms.id", ondelete="CASCADE"), index=True))
+
+    title: str
+    description: Optional[str] = None
+    order_index: int = 0
+    is_published: bool = False
+
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class CourseModuleCreate(SQLModel):
+    class_id: str
+    subject_id: str
+    academic_term_id: str
+    title: str
+    description: Optional[str] = None
+    order_index: int = 0
+
+
+class CourseModuleUpdate(SQLModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    order_index: Optional[int] = None
+    is_published: Optional[bool] = None
+
+
+class CourseModuleItem(SQLModel, table=True):
+    """
+    A single ordered entry in a CourseModule — an embedded video link, an
+    uploaded/hosted video file, a pointer to an existing LearningMaterial
+    row, or a pointer to an existing Assignment (a "quiz/assessment" item —
+    reuses the teacher portal's full Assignment/AssignmentQuestion/
+    Submission/AutoGrader machinery rather than a parallel quiz engine).
+    Exactly one of video_url/learning_material_id/assignment_id is
+    expected, enforced at the router layer (see
+    routers/teacher/assignments.py::add_course_module_item).
+
+    video_source distinguishes the two video_url flavors: "link" (an
+    external URL — YouTube, Vimeo, etc. — opened in a new tab, never
+    embedded) vs "upload" (a file saved under uploads/course-videos/ and
+    served from this app's own /uploads static mount, played inline via
+    an HTML5 <video> element). See
+    routers/teacher/assignments.py::upload_course_module_video.
+    """
+    __tablename__ = "course_module_items"
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    school_id: str = Field(index=True)
+    module_id: str = Field(sa_column=Column(String, ForeignKey("course_modules.id", ondelete="CASCADE"), index=True))
+
+    title: str
+    video_url: Optional[str] = None
+    video_source: Optional[str] = None  # "link" | "upload" — see class docstring
+    learning_material_id: Optional[str] = Field(
+        default=None,
+        sa_column=Column(String, ForeignKey("learning_materials.id", ondelete="SET NULL"), index=True, nullable=True)
+    )
+    # A "quiz/assessment" item — points at an existing Assignment (any
+    # AssignmentType, not just QUIZ; a teacher may want a homework or
+    # project attached to a module too). Completion for this item type is
+    # derived from Submission.status (see student_portal.py), never
+    # manually toggled the way video/material items are.
+    assignment_id: Optional[str] = Field(
+        default=None,
+        sa_column=Column(String, ForeignKey("assignments.id", ondelete="SET NULL"), index=True, nullable=True)
+    )
+    order_index: int = 0
+
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class CourseModuleItemCreate(SQLModel):
+    title: str
+    video_url: Optional[str] = None
+    learning_material_id: Optional[str] = None
+    assignment_id: Optional[str] = None
+    order_index: int = 0
+
+
+class StudentModuleProgress(SQLModel, table=True):
+    """A completion checkmark — no quiz/scoring engine. One row per
+    (student, module_item) that the student has marked complete;
+    unmarking deletes the row rather than tracking history."""
+    __tablename__ = "student_module_progress"
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    school_id: str = Field(index=True)
+    student_id: str = Field(index=True)
+    module_item_id: str = Field(sa_column=Column(String, ForeignKey("course_module_items.id", ondelete="CASCADE"), index=True))
+
+    completed_at: datetime = Field(default_factory=datetime.utcnow)

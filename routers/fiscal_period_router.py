@@ -26,8 +26,13 @@ from services.fiscal_period_service import (
     FiscalPeriodValidationError,
 )
 from dependencies import get_current_school_id
-from auth import get_current_user 
+from auth import get_current_user, require_roles
 from database import get_session
+from models.user import User, UserRole
+
+# Fiscal period lifecycle (create/lock/close/set-current) is restricted to
+# the same role set journal.py/coa.py already use for GL-affecting actions.
+FINANCE_ADMIN_ROLES = (UserRole.SUPER_ADMIN, UserRole.SCHOOL_ADMIN, UserRole.HR)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/fiscal-periods", tags=["Fiscal Periods"])
@@ -47,7 +52,7 @@ class CheckPostingRequest(SQLModel):
 @router.post("/", response_model=dict)
 async def create_fiscal_period(
     period_data: FiscalPeriodCreate,
-    current_user: dict = Depends(get_current_user),
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
     request: Request = None,
@@ -296,7 +301,7 @@ async def get_fiscal_period(
 async def lock_fiscal_period(
     period_id: str,
     body: PeriodNotesRequest = PeriodNotesRequest(),
-    current_user: dict = Depends(get_current_user),
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -351,7 +356,7 @@ async def lock_fiscal_period(
 async def close_fiscal_period(
     period_id: str,
     body: PeriodNotesRequest = PeriodNotesRequest(),
-    current_user: dict = Depends(get_current_user),
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -405,7 +410,7 @@ async def close_fiscal_period(
 @router.post("/{period_id}/set-current", response_model=dict)
 async def set_current_period(
     period_id: str,
-    current_user: dict = Depends(get_current_user),
+    current_user: User = Depends(require_roles(*FINANCE_ADMIN_ROLES)),
     school_id: str = Depends(get_current_school_id),
     session: AsyncSession = Depends(get_session),
 ) -> dict:

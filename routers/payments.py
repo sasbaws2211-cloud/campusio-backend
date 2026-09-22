@@ -3,7 +3,7 @@ import logging
 import json
 from typing import List, Optional
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import and_
 from sqlmodel import select
@@ -16,10 +16,40 @@ from models.payment import OnlineTransaction, TransactionStatus, TransactionType
 from models.user import User, UserRole
 from models.fee import Fee
 from models.student import Student, Parent, StudentParent
+from models.billing import BillingConfiguration
+from services.plan_gating import require_plan_feature
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/payments", tags=["payments"])
+
+
+async def _save_paystack_authorization(session: AsyncSession, school_id: str, charge_data: dict) -> None:
+    """Save a reusable card authorization from a successful platform
+    subscription charge, so services/scheduler.py can auto-charge future
+    renewals instead of the school having to remember to pay each cycle.
+    Only ever called for charge.success on a PLAT- reference — never for
+    school-fee payments, which have nothing to do with the school's own
+    platform subscription."""
+    authorization = charge_data.get("authorization") or {}
+    if not authorization.get("reusable") or not authorization.get("authorization_code"):
+        return
+
+    result = await session.execute(
+        select(BillingConfiguration).where(BillingConfiguration.school_id == school_id)
+    )
+    config = result.scalar_one_or_none()
+    if not config:
+        config = BillingConfiguration(school_id=school_id)
+        session.add(config)
+
+    config.paystack_authorization_code = authorization.get("authorization_code")
+    config.paystack_customer_code = (charge_data.get("customer") or {}).get("customer_code")
+    config.paystack_card_last4 = authorization.get("last4")
+    config.paystack_card_brand = authorization.get("card_type") or authorization.get("brand")
+    config.updated_at = datetime.utcnow()
+    session.add(config)
+    logger.info(f"Saved reusable Paystack authorization for school {school_id} (auto-renewal)")
 
 
 def get_payment_services():
@@ -181,6 +211,7 @@ class TransactionResponse:
 async def request_momo_payment(
     request_data: RequestMomoPaymentRequest,
     current_user: User = Depends(get_current_user),
+    _plan_check: User = Depends(require_plan_feature("fees_plus")),
     session: AsyncSession = Depends(get_session)
 ) -> dict:
     """Send a mobile-money payment prompt to a parent's phone (school-initiated).
@@ -224,6 +255,7 @@ async def request_momo_payment(
 async def initialize_payment(
     request_data: InitiatePaymentRequest,
     current_user: User = Depends(get_current_user),
+    _plan_check: User = Depends(require_plan_feature("fees_plus")),
     session: AsyncSession = Depends(get_session)
 ) -> dict:
     """
@@ -280,7 +312,7 @@ async def initialize_payment(
         )
         
         # Calculate amount to pay
-        amount_due = fee.amount_due - fee.amount_paid
+        amount_due = fee.amount_due - fee.amount_paid - (fee.discount or 0)
         
         if amount_due <= 0:
             raise HTTPException(
@@ -382,9 +414,54 @@ async def initialize_payment(
         )
 
 
+async def _handle_payroll_transfer_webhook(session: AsyncSession, event: str, data: dict) -> None:
+    """Reconcile a payroll disbursement's real outcome from Paystack's own
+    async confirmation, instead of trusting only the synchronous
+    initiate_transfer response — see services/payroll_service.py::
+    disburse_payroll_run, which sets transfer_reference to
+    "PAYROLL-{line_item_id}" before this webhook ever fires. Matched by
+    that reference, not the line item's id directly, since Paystack echoes
+    back whatever reference we originally sent."""
+    from models.payroll import PayrollLineItem
+
+    reference = data.get("reference")
+    if not reference or not str(reference).startswith("PAYROLL-"):
+        return
+
+    line_item_id = str(reference)[len("PAYROLL-"):]
+    result = await session.execute(select(PayrollLineItem).where(PayrollLineItem.id == line_item_id))
+    line_item = result.scalar_one_or_none()
+    if not line_item:
+        logger.warning(f"Payroll transfer webhook for unknown line item (reference={reference})")
+        return
+
+    if event == "transfer.success":
+        line_item.payment_status = "paid"
+        line_item.payment_failure_reason = None
+        if not line_item.paid_at:
+            line_item.paid_at = datetime.utcnow()
+    elif event in ("transfer.failed", "transfer.reversed"):
+        # A transfer that looked accepted synchronously but actually
+        # failed/reversed — flip it back to failed so disburse_payroll_run
+        # picks it up again on retry (it only retries "unpaid"/"failed"
+        # line items) instead of it staying stuck showing "paid" for money
+        # that never actually arrived.
+        line_item.payment_status = "failed"
+        line_item.payment_failure_reason = f"Paystack {event}: {data.get('reason') or 'transfer did not complete'}"
+        line_item.paid_at = None
+    else:
+        return
+
+    line_item.updated_at = datetime.utcnow()
+    session.add(line_item)
+    await session.commit()
+    logger.info(f"Payroll transfer webhook processed: {event} for line item {line_item_id}")
+
+
 @router.post("/webhook/paystack", status_code=200)
 async def paystack_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session)
 ) -> dict:
     """
@@ -458,9 +535,20 @@ async def paystack_webhook(
         event = payload.get("event")
         logger.info(f"Paystack webhook received: event={event}")
 
+        # transfer.* events confirm/reject a payroll disbursement
+        # asynchronously — disburse_payroll_run's synchronous
+        # initiate_transfer response only means "Paystack accepted the
+        # request," not "the money has actually arrived." Previously every
+        # transfer.* event was silently dropped here, so a transfer that
+        # went into "success" only via webhook (or later reversed) never
+        # updated PayrollLineItem.payment_status at all.
+        if event and str(event).startswith("transfer."):
+            await _handle_payroll_transfer_webhook(session, event, payload.get("data", {}) or {})
+            return {"success": True, "processed": True}
+
         # Only charge events represent money movement on our references.
-        # Paystack also sends transfer.*, subscription.*, refund.* etc — a
-        # signed non-charge event must never be treated as a payment.
+        # Paystack also sends subscription.*, refund.* etc — a signed
+        # non-charge, non-transfer event must never be treated as a payment.
         if event and not str(event).startswith("charge."):
             logger.info(f"Ignoring non-charge webhook event: {event}")
             return {"success": True, "processed": False}
@@ -507,6 +595,11 @@ async def paystack_webhook(
                 amount_paid=data.get("amount", 0) / 100 if isinstance(data, dict) else 0
             )
             logger.info(f"Billing webhook processed: {result}")
+
+            if result.get("success") and isinstance(data, dict):
+                await _save_paystack_authorization(session, transaction.school_id, data)
+                await session.commit()
+
             return {"success": True, "processed": result.get("success", False)}
         else:
             # Individual fee payment - use online payment service
@@ -514,7 +607,8 @@ async def paystack_webhook(
             online_payment_service = services["online_payment"]
             result = await online_payment_service.process_webhook(
                 session=session,
-                payload=payload
+                payload=payload,
+                background_tasks=background_tasks
             )
             logger.info(f"Webhook processed: {payload.get('reference')}")
         return {"success": True, "processed": result.get("processed", True)}
@@ -539,6 +633,7 @@ async def paystack_webhook(
 async def get_transaction_status(
     transaction_id: str,
     current_user: User = Depends(get_current_user),
+    _plan_check: User = Depends(require_plan_feature("fees_plus")),
     session: AsyncSession = Depends(get_session)
 ) -> dict:
     """
@@ -639,6 +734,7 @@ async def list_transactions(
     limit: int = 50,
     status_filter: Optional[str] = None,
     current_user: User = Depends(get_current_user),
+    _plan_check: User = Depends(require_plan_feature("fees_plus")),
     session: AsyncSession = Depends(get_session)
 ) -> dict:
     """
@@ -774,6 +870,7 @@ class MarkRefundedRequest(BaseModel):
 @router.get("/refunds/pending", status_code=200)
 async def get_pending_fee_refunds(
     current_user: User = Depends(get_current_user),
+    _plan_check: User = Depends(require_plan_feature("fees_plus")),
     session: AsyncSession = Depends(get_session)
 ) -> dict:
     """
@@ -818,6 +915,7 @@ async def mark_fee_refund_completed(
     transaction_id: str,
     body: MarkRefundedRequest = MarkRefundedRequest(),
     current_user: User = Depends(get_current_user),
+    _plan_check: User = Depends(require_plan_feature("fees_plus")),
     session: AsyncSession = Depends(get_session)
 ) -> dict:
     """
@@ -858,6 +956,7 @@ async def mark_fee_refund_completed(
 async def verify_payment_with_paystack(
     transaction_id: str,
     current_user: User = Depends(get_current_user),
+    _plan_check: User = Depends(require_plan_feature("fees_plus")),
     session: AsyncSession = Depends(get_session)
 ) -> dict:
     """

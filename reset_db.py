@@ -5,7 +5,7 @@ async def reset_db():
     conn = await asyncpg.connect(
         user='postgres',
         password='2211',
-        database='school-erp',
+        database='campusio',
         host='localhost',
         port=5432
     )
