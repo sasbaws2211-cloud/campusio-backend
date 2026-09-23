@@ -1,6 +1,6 @@
 """Symmetric encryption for BYOK API keys at rest.
 
-Derives a Fernet key from the app's existing SECRET_KEY env var (already
+Derives a Fernet key from the app's existing secret_key env var (already
 used for JWT signing — see auth.py) via SHA-256, so no new secret needs
 to be provisioned. Never log or return a decrypted key.
 """
@@ -11,9 +11,9 @@ from cryptography.fernet import Fernet
 
 
 def _get_fernet() -> Fernet:
-    secret = os.environ.get("SECRET_KEY", "")
+    secret = os.environ.get("secret_key", "")
     if not secret:
-        raise RuntimeError("SECRET_KEY is not configured")
+        raise RuntimeError("secret_key is not configured")
     key = base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest())
     return Fernet(key)
 
