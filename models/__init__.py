@@ -31,6 +31,7 @@ from models.security import (
     AuthorizedPickupPerson, StudentLocationLog,
 )
 from models.user import User, UserCreate, UserLogin, UserResponse, UserRole
+from models.rbac import Permission, Role, RolePermission
 from models.login_attempt import LoginAttempt
 from models.school import (
     School, SchoolCreate, SchoolType, AcademicTerm, AcademicTermCreate, TermType,
@@ -55,6 +56,7 @@ from models.payroll import (
     PayrollLineItem, PayrollAdjustment, PayrollAdjustmentCreate,
     PayrollCategory, PayslipResponse
 )
+from models.staff_loan import StaffLoan, StaffLoanCreate, StaffLoanRepayment, LoanStatus, LoanWriteOffRequest
 from models.timetable import Timetable, TimetableCreate, Period, PeriodCreate, DayOfWeek, PeriodType
 from models.communication import Announcement, AnnouncementCreate, AnnouncementType, AnnouncementAudience, Message, MessageCreate, EmailNotification
 from models.report_template import ReportTemplate, ReportTemplateCreate, ReportTemplateUpdate, ReportTemplateResponse
@@ -113,6 +115,7 @@ from models.billing import (
     DiscountRule, PaymentReminder, LateFeeCharge,
     BillingReport
 )
+from models.integrations import ApiKey, WebhookEndpoint, WebhookDelivery
 from models.settlement import Withdrawal, WithdrawalStatus, WithdrawalRead
 from models.ticket import (
     Ticket, TicketCreate, TicketUpdate, TicketResponse, TicketDetailResponse,

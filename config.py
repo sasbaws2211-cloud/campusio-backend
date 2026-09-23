@@ -2,6 +2,10 @@
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 from typing import Optional
+from pathlib import Path
+
+
+BACKEND_DIR = Path(__file__).resolve().parent
 
 
 class Settings(BaseSettings):
@@ -67,7 +71,10 @@ class Settings(BaseSettings):
     cors_origins: list[str]
     
     class Config:
-        env_file = ".env"
+        # Resolve the local file from the backend package, not the process
+        # working directory. Standalone scripts are commonly run from
+        # backend/scripts, while the deployment process supplies env vars.
+        env_file = str(BACKEND_DIR / ".env")
         case_sensitive = False
         extra = "ignore"
 

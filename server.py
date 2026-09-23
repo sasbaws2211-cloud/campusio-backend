@@ -285,6 +285,12 @@ async def lifespan(app: FastAPI):
     
     # Initialize database
     await init_db()
+
+    # Keep the system permission catalog and default role grants in sync with
+    # the deployed code. This is idempotent and ensures migrated endpoints do
+    # not deny valid roles after a fresh database or a new permission is added.
+    from scripts.seed_permissions import seed_permissions
+    await seed_permissions()
     
     # Register routers (lazy load)
     await register_routers(app)

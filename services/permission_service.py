@@ -12,6 +12,7 @@ import logging
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import ProgrammingError
 from sqlmodel import select
 
 from auth import get_redis
@@ -21,19 +22,31 @@ from models.user import User
 logger = logging.getLogger(__name__)
 
 CACHE_TTL_SECONDS = 900  # matches auth.py's user cache TTL
+CACHE_KEY_PREFIX = "role_permissions:v2"
 
 
 async def _resolve_role_id(session: AsyncSession, user: User) -> Optional[str]:
     """The Role row that governs `user`'s permissions."""
     if user.role_id:
         return user.role_id
-    result = await session.execute(
-        select(Role.id).where(
-            Role.is_system == True,  # noqa: E712
-            Role.school_id.is_(None),
-            Role.name == user.role.value,
+    try:
+        result = await session.execute(
+            select(Role.id).where(
+                Role.is_system == True,  # noqa: E712
+                Role.school_id.is_(None),
+                Role.name == user.role.value,
+            )
         )
-    )
+    except ProgrammingError as exc:
+        # Older deployments may have been initialized with create_all before
+        # the RBAC migration was introduced. Permissions are additive, so an
+        # absent RBAC schema must not prevent authentication or /auth/me from
+        # returning plan entitlements.
+        if 'relation "roles" does not exist' not in str(exc).lower():
+            raise
+        await session.rollback()
+        logger.warning("RBAC tables are not migrated; returning no permissions")
+        return None
     return result.scalar_one_or_none()
 
 
@@ -50,7 +63,7 @@ async def get_user_permissions(session: AsyncSession, user: User) -> set[str]:
         return set()
 
     redis_client = await get_redis()
-    cache_key = f"role_permissions:{role_id}"
+    cache_key = f"{CACHE_KEY_PREFIX}:{role_id}"
 
     if redis_client:
         try:
@@ -82,6 +95,6 @@ async def invalidate_role_permissions_cache(role_id: str) -> None:
     redis_client = await get_redis()
     if redis_client:
         try:
-            await redis_client.delete(f"role_permissions:{role_id}")
+            await redis_client.delete(f"{CACHE_KEY_PREFIX}:{role_id}")
         except Exception as e:
             logger.warning(f"Redis cache invalidation error (permissions): {e}")
