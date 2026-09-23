@@ -188,6 +188,16 @@ from models.exam_papers import (
     ExamPaper, ExamPaperCreate, ExamPaperUpdate, ExamPaperStatus,
     ExamPaperModerationDecision, ExamPaperQuestion, ExamPaperQuestionAdd,
 )
+from models.exam import (
+    ExamSession, ExamSessionCreate, ExamSessionUpdate, ExamSessionStatus,
+    ExamSessionReleaseDate, ExamSchedule, ExamScheduleCreate, ExamScheduleUpdate,
+    ExamSeatAssignment, ExamSeatAssignmentUpdate, ExamInvigilator, ExamInvigilatorCreate,
+)
+from models.exam_marks import (
+    ExamComponent, ExamComponentCreate, ExamComponentUpdate,
+    ExamComponentMark, ExamComponentMarkUpsert, BulkExamComponentMarksUpsert,
+)
+from models.exam_remarks import ExamRemarkRequest, ExamRemarkRequestCreate, ExamRemarkRequestReview, RemarkRequestStatus
 from models.certificates import (
     CertificateIssuance, CertificateIssuanceCreate, CertificateType,
     CertificateTemplate, CertificateTemplateCreate, CertificateTemplateUpdate,
