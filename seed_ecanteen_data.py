@@ -129,7 +129,8 @@ async def create_wallet_account(session, school, student, parent_user):
             (CanteenWalletAccount.student_id == student.id)
         )
     )
-    account = result.first()
+    accounts = result.all()
+    account = accounts[0] if accounts else None
     if not account:
         account = CanteenWalletAccount(
             school_id=school.id,

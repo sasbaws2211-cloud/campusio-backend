@@ -91,9 +91,18 @@ class CanteenWalletService:
             select(CanteenWalletAccount).where(
                 CanteenWalletAccount.school_id == school_id,
                 CanteenWalletAccount.student_id == student_id,
-            )
+            ).order_by(CanteenWalletAccount.created_at, CanteenWalletAccount.id)
         )
-        account = result.scalar_one_or_none()
+        accounts = result.scalars().all()
+        account = accounts[0] if accounts else None
+        if len(accounts) > 1:
+            logger.warning(
+                "Duplicate canteen wallet accounts found for school=%s student=%s; "
+                "using oldest account=%s",
+                school_id,
+                student_id,
+                account.id,
+            )
         if account is None:
             account = CanteenWalletAccount(school_id=school_id, student_id=student_id, parent_id=parent_id)
             session.add(account)
