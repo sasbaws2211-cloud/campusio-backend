@@ -144,6 +144,12 @@ from models.extra_class import (
 from models.ai_settings import AIProvider, SchoolAISettings, AISettingsResponse, UpdateAISettingsRequest
 from models.audit import SystemAuditLog, SystemAuditLogResponse
 from models.document import Document, DocumentOwnerType, DocumentCategory
+from models.ptm import PTMSlot, PTMBooking, PTMSlotStatus, PTMBookingStatus, PTMSlotCreate, PTMBookingCreate, PTMCancelRequest
+from models.parent_requests import (
+    AbsenceRequest, AbsenceRequestCreate, AbsenceRequestReview, AbsenceRequestType,
+    RequestStatus, DocumentRequest, DocumentRequestCreate, DocumentRequestReview,
+    DocumentRequestFulfill, DocumentRequestStatus, DocumentType,
+)
 from models.front_office import (
     FrontOfficeVisitor, FrontOfficeVisitorCreate, FrontOfficeVisitorUpdate, VisitorStatus,
     VisitorApprovalStatus, RejectVisitorRequest,
