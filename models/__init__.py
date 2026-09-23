@@ -182,6 +182,7 @@ from models.exam_board import (
     ExamSeatingAssignment, ExamSeatingAssignmentCreate, ExamSeatingAssignmentUpdate,
     InvigilationDuty, InvigilationDutyCreate, InvigilationDutyUpdate,
 )
+from models.exam_malpractice import MalpracticeCase, MalpracticeCaseCreate, MalpracticeCaseUpdate, MalpracticeStatus, MalpracticeSanction
 from models.certificates import (
     CertificateIssuance, CertificateIssuanceCreate, CertificateType,
     CertificateTemplate, CertificateTemplateCreate, CertificateTemplateUpdate,
