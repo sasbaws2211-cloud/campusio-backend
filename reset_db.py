@@ -7,7 +7,7 @@ async def reset_db():
         password='',
         database='',
         host='',
-        port=12017
+        port=5308
     )
     
     try:
