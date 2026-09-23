@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 import string
 import uuid
+import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,6 +20,8 @@ from models.canteen_wallet import (
     CanteenWalletLedgerEntry,
 )
 from models.payment import OnlineTransaction
+
+logger = logging.getLogger(__name__)
 
 # Valid forward transitions for an order's lifecycle. Anything not listed
 # here (including every transition out of a terminal state) is rejected.
