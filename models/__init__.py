@@ -143,6 +143,7 @@ from models.extra_class import (
 )
 from models.ai_settings import AIProvider, SchoolAISettings, AISettingsResponse, UpdateAISettingsRequest
 from models.audit import SystemAuditLog, SystemAuditLogResponse
+from models.document import Document, DocumentOwnerType, DocumentCategory
 from models.front_office import (
     FrontOfficeVisitor, FrontOfficeVisitorCreate, FrontOfficeVisitorUpdate, VisitorStatus,
     VisitorApprovalStatus, RejectVisitorRequest,
