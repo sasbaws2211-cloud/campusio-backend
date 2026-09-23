@@ -204,6 +204,7 @@ from models.leave_request import LeaveRequest, LeaveBalance, LeaveType, LeaveReq
 from models.leave_encashment import LeaveEncashmentRequest, LeaveEncashmentCreate, LeaveEncashmentStatus
 from models.overtime import OvertimeRecord
 from models.staff_performance_plus import StaffGoal, PerformanceFeedbackRequest, PerformanceFeedback, PerformanceImprovementPlan
+from models.strategic_goals import StrategicGoal, StrategicGoalCreate, StrategicGoalUpdate, StrategicGoalProgressUpdate
 from models.succession_planning import SuccessionPlan
 from models.department import Department
 from models.hr_admin import BenefitPlan
