@@ -62,8 +62,8 @@ async def seed_data():
         # Create OTP settings for super admin (mandatory OTP)
         super_admin_otp = OTPSettings(
             user_id=super_admin.id,
-            is_enabled=True,
-            is_mandatory=True,
+            is_enabled=False,
+            is_mandatory=False,
             method="sms"
         )
         session.add(super_admin_otp)
@@ -84,8 +84,8 @@ async def seed_data():
         # Create OTP settings for school admin (mandatory OTP)
         school_admin_otp = OTPSettings(
             user_id=school_admin.id,
-            is_enabled=True,
-            is_mandatory=True,
+            is_enabled=False,
+            is_mandatory=False,
             method="sms"
         )
         session.add(school_admin_otp)

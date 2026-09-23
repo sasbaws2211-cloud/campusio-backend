@@ -3,11 +3,11 @@ import asyncpg
 
 async def reset_db():
     conn = await asyncpg.connect(
-        user='postgres',
-        password='2211',
-        database='campusio',
-        host='localhost',
-        port=5432
+        user='',
+        password='',
+        database='',
+        host='',
+        port=12017
     )
     
     try:
