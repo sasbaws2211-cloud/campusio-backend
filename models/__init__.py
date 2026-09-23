@@ -153,6 +153,10 @@ from models.parent_requests import (
 from models.parent_consent_forms import (
     ConsentForm, ConsentFormCreate, ConsentResponse, ConsentResponseSubmit, ConsentResponseStatus,
 )
+from models.complaints import (
+    Complaint, ComplaintCreate, ComplaintUpdate, ComplaintStatus,
+    ComplaintComment, ComplaintCommentCreate, ComplaintCategory, ComplaintSeverity,
+)
 from models.front_office import (
     FrontOfficeVisitor, FrontOfficeVisitorCreate, FrontOfficeVisitorUpdate, VisitorStatus,
     VisitorApprovalStatus, RejectVisitorRequest,
