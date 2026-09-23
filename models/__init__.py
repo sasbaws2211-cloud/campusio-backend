@@ -183,6 +183,11 @@ from models.exam_board import (
     InvigilationDuty, InvigilationDutyCreate, InvigilationDutyUpdate,
 )
 from models.exam_malpractice import MalpracticeCase, MalpracticeCaseCreate, MalpracticeCaseUpdate, MalpracticeStatus, MalpracticeSanction
+from models.exam_papers import (
+    QuestionBankItem, QuestionBankItemCreate, QuestionBankItemUpdate,
+    ExamPaper, ExamPaperCreate, ExamPaperUpdate, ExamPaperStatus,
+    ExamPaperModerationDecision, ExamPaperQuestion, ExamPaperQuestionAdd,
+)
 from models.certificates import (
     CertificateIssuance, CertificateIssuanceCreate, CertificateType,
     CertificateTemplate, CertificateTemplateCreate, CertificateTemplateUpdate,
