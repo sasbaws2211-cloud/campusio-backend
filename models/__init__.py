@@ -150,6 +150,9 @@ from models.parent_requests import (
     RequestStatus, DocumentRequest, DocumentRequestCreate, DocumentRequestReview,
     DocumentRequestFulfill, DocumentRequestStatus, DocumentType,
 )
+from models.parent_consent_forms import (
+    ConsentForm, ConsentFormCreate, ConsentResponse, ConsentResponseSubmit, ConsentResponseStatus,
+)
 from models.front_office import (
     FrontOfficeVisitor, FrontOfficeVisitorCreate, FrontOfficeVisitorUpdate, VisitorStatus,
     VisitorApprovalStatus, RejectVisitorRequest,
