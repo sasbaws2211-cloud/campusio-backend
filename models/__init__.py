@@ -201,6 +201,7 @@ from models.analytics import AnalyticsSnapshot, ClassPerformanceSummary, RiskLev
 # its Alembic migration, not via create_all()); fixed alongside the new
 # HR-workflow-depth models below.
 from models.leave_request import LeaveRequest, LeaveBalance, LeaveType, LeaveRequestStatus
+from models.leave_encashment import LeaveEncashmentRequest, LeaveEncashmentCreate, LeaveEncashmentStatus
 from models.overtime import OvertimeRecord
 from models.staff_performance_plus import StaffGoal, PerformanceFeedbackRequest, PerformanceFeedback, PerformanceImprovementPlan
 from models.succession_planning import SuccessionPlan
